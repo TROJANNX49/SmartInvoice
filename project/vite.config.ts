@@ -20,10 +20,16 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
-          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-          'pdf': ['jspdf', 'html2canvas'],
-          'supabase': ['@supabase/supabase-js'],
+        manualChunks: (id: string) => {
+          if (id.includes('react') || id.includes('react-dom') || id.includes('react-router-dom')) {
+            return 'react-vendor';
+          }
+          if (id.includes('jspdf') || id.includes('html2canvas')) {
+            return 'pdf';
+          }
+          if (id.includes('@supabase')) {
+            return 'supabase';
+          }
         },
       },
     },
