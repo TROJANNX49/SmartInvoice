@@ -22,16 +22,61 @@ export function generateInvoiceNumber(): string {
   return `${year}${month}-${random}`;
 }
 
-// ─── Parser ──────────────────────────────────────────────────────────────────
+// ─── LLM Parser (calls server-side API) ──────────────────────────────────────
 
 /**
- * Parses raw freeform notes into structured invoice data using regex heuristics.
- * Handles common patterns like:
- *   Client: Name / client name, email, address
- *   Line items with prices ($100, $50/hr, 2 x $30)
- *   Due date / payment terms
+ * Parses raw freeform notes into structured invoice data via the
+ * server-side /api/parse-invoice endpoint (backed by OpenAI gpt-4o-mini).
+ * Falls back to the regex heuristic parser if the API call fails.
  */
-export function parseRawNotesWithAI(rawText: string): ParsedInvoice {
+export async function parseRawNotesWithAI(
+  rawText: string,
+  signal?: AbortSignal,
+): Promise<ParsedInvoice> {
+  try {
+    const res = await fetch('/api/parse-invoice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: rawText }),
+      signal,
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error ?? `API error ${res.status}`);
+    }
+
+    const data = await res.json();
+
+    // Ensure items array is populated even if LLM returned nothing
+    const items: InvoiceItem[] =
+      Array.isArray(data.items) && data.items.length > 0
+        ? data.items
+        : [{ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 }];
+
+    return {
+      client_name: data.client_name ?? '',
+      client_email: data.client_email ?? '',
+      client_address: data.client_address ?? '',
+      items,
+      notes: data.notes ?? '',
+      payment_terms: data.payment_terms ?? '',
+      due_days: typeof data.due_days === 'number' ? data.due_days : null,
+    };
+  } catch (err) {
+    // Don't fall back on user-initiated cancellation
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    console.warn('[aiParser] API call failed, falling back to regex:', err);
+    return parseRawNotesRegex(rawText);
+  }
+}
+
+// ─── Regex Fallback Parser ────────────────────────────────────────────────────
+
+/**
+ * Local regex heuristic parser used as a fallback when the API is unavailable.
+ */
+function parseRawNotesRegex(rawText: string): ParsedInvoice {
   const lines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
 
   // ── Client info ────────────────────────────────────────────────────────────
@@ -40,52 +85,26 @@ export function parseRawNotesWithAI(rawText: string): ParsedInvoice {
   let client_address = '';
 
   for (const line of lines) {
-    const lowerLine = line.toLowerCase();
-
-    // Client: John Smith
     if (!client_name && /^client\s*[:：]\s*/i.test(line)) {
       client_name = line.replace(/^client\s*[:：]\s*/i, '').trim();
       continue;
     }
-
-    // Email: john@example.com
     if (!client_email && /^(?:email|e-mail)\s*[:：]\s*/i.test(line)) {
       client_email = line.replace(/^(?:email|e-mail)\s*[:：]\s*/i, '').trim();
       continue;
     }
-
-    // Address: 123 Main St
     if (!client_address && /^(?:address|addr|location)\s*[:：]\s*/i.test(line)) {
       client_address = line.replace(/^(?:address|addr|location)\s*[:：]\s*/i, '').trim();
       continue;
     }
-
-    // Inline email detection
     if (!client_email) {
       const emailMatch = line.match(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i);
-      if (emailMatch) {
-        client_email = emailMatch[0];
-      }
+      if (emailMatch) client_email = emailMatch[0];
     }
   }
 
   // ── Line items ─────────────────────────────────────────────────────────────
   const items: InvoiceItem[] = [];
-
-  // Patterns for extracting prices:
-  // - "Website redesign: $1200"
-  // - "- Logo design: $400"
-  // - "SEO optimization (5 hours) at $100/hr: $500"
-  // - "5 hours @ $100/hr"
-  // - "2 x $50"
-  const itemPatterns = [
-    // "Description: $amount" or "Description - $amount"
-    /^[-•*]?\s*(.+?)[\s\-–:]+\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/,
-    // "Description ($amount)"
-    /^[-•*]?\s*(.+?)\s+\(\$\s*([\d,]+(?:\.\d{1,2})?)\)\s*$/,
-    // "(qty) x $price" or "(qty) @ $price/hr"
-    /^[-•*]?\s*(.+?)\s+\((\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\)\s+(?:at|@)\s+\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:\/hr)?\s*[:–-]?\s*\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/i,
-  ];
 
   const skipPrefixes = [
     /^client\s*[:：]/i,
@@ -100,13 +119,10 @@ export function parseRawNotesWithAI(rawText: string): ParsedInvoice {
   ];
 
   for (const line of lines) {
-    // Skip metadata lines
     if (skipPrefixes.some((p) => p.test(line))) continue;
-
-    // Skip lines that look like plain headers
     if (/^[A-Za-z\s]+:$/.test(line)) continue;
 
-    // Try hour-based pattern first: "Task (5 hours) at $100/hr: $500"
+    // "Task (5 hours) at $100/hr: $500"
     const hourMatch = line.match(
       /^[-•*]?\s*(.+?)\s+\((\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\)\s+(?:at|@)\s+\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:\/hr)?\s*[:–-]?\s*\$\s*([\d,]+(?:\.\d{1,2})?)?/i
     );
@@ -114,56 +130,32 @@ export function parseRawNotesWithAI(rawText: string): ParsedInvoice {
       const desc = hourMatch[1].trim();
       const qty = parseFloat(hourMatch[2]);
       const rate = parseFloat(hourMatch[3].replace(/,/g, ''));
-      const total = hourMatch[4]
-        ? parseFloat(hourMatch[4].replace(/,/g, ''))
-        : qty * rate;
+      const total = hourMatch[4] ? parseFloat(hourMatch[4].replace(/,/g, '')) : qty * rate;
       if (desc && qty > 0 && rate > 0) {
-        items.push({
-          id: crypto.randomUUID(),
-          description: desc,
-          quantity: qty,
-          unit_price: rate,
-          total,
-        });
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total });
         continue;
       }
     }
 
-    // Simple "Description: $amount"
-    const simpleMatch = line.match(
-      /^[-•*]?\s*(.+?)[\s\-–:]+\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/
-    );
+    // "Description: $amount"
+    const simpleMatch = line.match(/^[-•*]?\s*(.+?)[\s\-–:]+\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/);
     if (simpleMatch) {
       const desc = simpleMatch[1].trim();
       const amount = parseFloat(simpleMatch[2].replace(/,/g, ''));
       if (desc && amount > 0 && !skipPrefixes.some((p) => p.test(desc))) {
-        items.push({
-          id: crypto.randomUUID(),
-          description: desc,
-          quantity: 1,
-          unit_price: amount,
-          total: amount,
-        });
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
         continue;
       }
     }
 
     // "N x $price" or "N @ $price"
-    const multiplyMatch = line.match(
-      /^[-•*]?\s*(.+?)\s+(\d+(?:\.\d+)?)\s*[x×@]\s*\$\s*([\d,]+(?:\.\d{1,2})?)/i
-    );
+    const multiplyMatch = line.match(/^[-•*]?\s*(.+?)\s+(\d+(?:\.\d+)?)\s*[x×@]\s*\$\s*([\d,]+(?:\.\d{1,2})?)/i);
     if (multiplyMatch) {
       const desc = multiplyMatch[1].trim();
       const qty = parseFloat(multiplyMatch[2]);
       const rate = parseFloat(multiplyMatch[3].replace(/,/g, ''));
       if (desc && qty > 0 && rate > 0) {
-        items.push({
-          id: crypto.randomUUID(),
-          description: desc,
-          quantity: qty,
-          unit_price: rate,
-          total: qty * rate,
-        });
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
       }
     }
   }
@@ -181,43 +173,23 @@ export function parseRawNotesWithAI(rawText: string): ParsedInvoice {
   let due_days: number | null = null;
 
   for (const line of lines) {
-    // "Payment due in 30 days"
     const dueDaysMatch = line.match(/(?:payment\s+)?due\s+in\s+(\d+)\s+days?/i);
-    if (dueDaysMatch) {
-      due_days = parseInt(dueDaysMatch[1], 10);
-    }
+    if (dueDaysMatch) due_days = parseInt(dueDaysMatch[1], 10);
 
-    // "Net 30" / "Net-30"
     const netMatch = line.match(/\bnet[-\s]?(\d+)\b/i);
     if (netMatch) {
       payment_terms = `Net ${netMatch[1]}`;
       if (!due_days) due_days = parseInt(netMatch[1], 10);
     }
 
-    // "Terms: ..."
     if (/^(?:payment\s+)?terms?\s*[:：]/i.test(line)) {
       payment_terms = line.replace(/^(?:payment\s+)?terms?\s*[:：]\s*/i, '').trim();
     }
   }
 
-  // ── Fallback: ensure at least one blank item ────────────────────────────────
   if (items.length === 0) {
-    items.push({
-      id: crypto.randomUUID(),
-      description: '',
-      quantity: 1,
-      unit_price: 0,
-      total: 0,
-    });
+    items.push({ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 });
   }
 
-  return {
-    client_name,
-    client_email,
-    client_address,
-    items,
-    notes,
-    payment_terms,
-    due_days,
-  };
+  return { client_name, client_email, client_address, items, notes, payment_terms, due_days };
 }

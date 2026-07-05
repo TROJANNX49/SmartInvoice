@@ -66,6 +66,7 @@ export function CreateInvoicePage() {
   }, [items, taxRate]);
 
   const previewRef = useRef<HTMLDivElement>(null);
+  const parseAbortRef = useRef<AbortController | null>(null);
 
   const handleDownloadPDF = async () => {
     if (!previewRef.current) return;
@@ -101,39 +102,44 @@ export function CreateInvoicePage() {
     }
   };
 
-  const handleAIParse = () => {
+  const handleAIParse = async () => {
     if (!rawNotes.trim()) {
       setError('Please enter some notes to parse');
       return;
     }
 
+    // Cancel any in-flight parse request before starting a new one
+    parseAbortRef.current?.abort();
+    const controller = new AbortController();
+    parseAbortRef.current = controller;
+
     setLoading(true);
     setError(null);
 
-    setTimeout(() => {
-      try {
-        const parsed = parseRawNotesWithAI(rawNotes);
-        setClientName(parsed.client_name || 'Client');
-        setClientEmail(parsed.client_email || '');
-        setClientAddress(parsed.client_address || '');
-        setItems(parsed.items.length > 0 ? parsed.items : [
-          { id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 },
-        ]);
-        setNotes(parsed.notes);
-        if (parsed.payment_terms) setTerms(parsed.payment_terms);
-        if (parsed.due_days) {
-          const d = new Date();
-          d.setDate(d.getDate() + parsed.due_days);
-          setDueDate(d.toISOString().split('T')[0]);
-        }
-        setTaxRate(0);
-        setStep('review');
-      } catch {
-        setError('Failed to parse notes. Please try again.');
-      } finally {
-        setLoading(false);
+    try {
+      const parsed = await parseRawNotesWithAI(rawNotes, controller.signal);
+      // Ignore result if this request was superseded
+      if (controller.signal.aborted) return;
+      setClientName(parsed.client_name || 'Client');
+      setClientEmail(parsed.client_email || '');
+      setClientAddress(parsed.client_address || '');
+      setItems(parsed.items.length > 0 ? parsed.items : [
+        { id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 },
+      ]);
+      setNotes(parsed.notes);
+      if (parsed.payment_terms) setTerms(parsed.payment_terms);
+      if (parsed.due_days) {
+        const d = new Date();
+        d.setDate(d.getDate() + parsed.due_days);
+        setDueDate(d.toISOString().split('T')[0]);
       }
-    }, 800);
+      setTaxRate(0);
+      setStep('review');
+    } catch {
+      setError('Failed to parse notes. Please try again.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleAddItem = () => {
