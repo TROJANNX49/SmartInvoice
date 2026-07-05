@@ -1,2 +1,3 @@
 - [SmartInvoice AI setup](smartinvoice-setup.md) — iCloud bookmark stubs replaced; Supabase env vars set; port 5000 Vite + port 3001 Express API.
 - [AI parser architecture](ai-parser-arch.md) — Express server proxied via Vite; OpenAI gpt-4o-mini; regex fallback; security hardening done.
+- [Stripe integration](stripe-integration.md) — uses STRIPE_SECRET_KEY secret directly (no Replit connector); full security hardening applied.

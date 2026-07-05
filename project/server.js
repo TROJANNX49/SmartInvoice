@@ -7,13 +7,78 @@ import { getUncachableStripeClient } from './stripeClient.js';
 
 const app = express();
 
-// ── Supabase admin client (service role, bypasses RLS) ────────────────────────
+// ── Supabase clients ──────────────────────────────────────────────────────────
+
+/** Service-role client — bypasses RLS. Only used in webhook handler. */
 function getSupabaseAdmin() {
   const url = process.env.VITE_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key)
     throw new Error('VITE_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required');
   return createClient(url, key, { auth: { persistSession: false } });
+}
+
+/** Anon client — used only to verify user JWTs. */
+function getSupabaseAnon() {
+  const url = process.env.VITE_SUPABASE_URL;
+  const key = process.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key)
+    throw new Error('VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY are required');
+  return createClient(url, key, { auth: { persistSession: false } });
+}
+
+/**
+ * Verify the Supabase JWT from `Authorization: Bearer <token>`.
+ * Returns the authenticated Supabase user or throws a 401 error.
+ */
+async function verifyAuth(req) {
+  const header = req.headers.authorization ?? '';
+  if (!header.startsWith('Bearer ')) {
+    const err = new Error('Missing or invalid Authorization header');
+    err.status = 401;
+    throw err;
+  }
+  const token = header.slice(7);
+  const supabase = getSupabaseAnon();
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) {
+    const err = new Error('Invalid or expired session');
+    err.status = 401;
+    throw err;
+  }
+  return user;
+}
+
+// ── Idempotency helper ────────────────────────────────────────────────────────
+
+/**
+ * Atomically claim a Stripe event AND increment credits in one DB transaction.
+ *
+ * Uses the `process_credit_event` Postgres function (see migration) so that:
+ *   - Claim + increment are a single atomic unit — if the UPDATE fails, the
+ *     INSERT rolls back too, and Stripe can retry cleanly.
+ *   - Returns 'duplicate' when the event ID was already processed (idempotent).
+ *   - Throws on any other DB error so the webhook handler returns 500 and
+ *     Stripe retries instead of silently dropping the credit.
+ *
+ * Requires the stripe_processed_events migration to be applied first.
+ */
+async function processCreditEvent(supabase, { eventId, userId, amount, stripeCustomerId }) {
+  const { data, error } = await supabase.rpc('process_credit_event', {
+    p_event_id:           eventId,
+    p_user_id:            userId,
+    p_amount:             amount,
+    p_stripe_customer_id: stripeCustomerId ?? null,
+  });
+
+  if (error) {
+    // Fail closed — throw so Stripe retries. Common cause: migration not applied.
+    throw new Error(
+      `process_credit_event RPC failed (ensure the stripe_processed_events migration has been run): ${error.message}`
+    );
+  }
+
+  return data; // 'ok' | 'duplicate'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -26,19 +91,28 @@ app.post(
   async (req, res) => {
     const sig = req.headers['stripe-signature'];
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const isProd = process.env.NODE_ENV === 'production';
 
     let event;
     try {
       const stripe = await getUncachableStripeClient();
+
       if (webhookSecret && sig) {
+        // Normal path: verify signature
         event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+      } else if (isProd) {
+        // Production with no secret = reject. Never allow unverified events in prod.
+        console.error('[webhook] STRIPE_WEBHOOK_SECRET is required in production');
+        return res.status(400).json({ error: 'Webhook secret not configured' });
       } else {
-        // No secret configured — parse without verification (dev only)
+        // Dev only: parse without verification and warn loudly
         event = JSON.parse(req.body.toString());
-        console.warn('[webhook] STRIPE_WEBHOOK_SECRET not set — skipping signature verification');
+        console.warn(
+          '[webhook] ⚠️  STRIPE_WEBHOOK_SECRET not set — skipping signature verification (dev only)'
+        );
       }
     } catch (err) {
-      console.error('[webhook] Signature error:', err.message);
+      console.error('[webhook] Signature/parse error:', err.message);
       return res.status(400).json({ error: err.message });
     }
 
@@ -46,8 +120,9 @@ app.post(
       await handleStripeEvent(event);
       res.json({ received: true });
     } catch (err) {
+      // Return 500 so Stripe will retry delivery
       console.error('[webhook] Handler error:', err.message);
-      res.status(500).json({ error: 'Handler failed' });
+      res.status(500).json({ error: 'Handler failed — will retry' });
     }
   }
 );
@@ -63,12 +138,12 @@ async function handleStripeEvent(event) {
       const session = event.data.object;
       const userId = session.client_reference_id;
       if (!userId) {
-        console.warn('[webhook] checkout.session.completed: no client_reference_id');
+        console.warn('[webhook] checkout.session.completed: no client_reference_id — skipping');
         break;
       }
 
       if (session.mode === 'subscription') {
-        // Pro plan upgrade
+        // Pro plan upgrade — subscriptions are naturally idempotent (same values)
         const { error } = await supabase
           .from('profiles')
           .update({
@@ -78,28 +153,26 @@ async function handleStripeEvent(event) {
             updated_at: new Date().toISOString(),
           })
           .eq('id', userId);
-        if (error) console.error('[webhook] profile update error:', error.message);
-        else console.log(`[webhook] Upgraded user ${userId} → Pro`);
-      } else if (session.mode === 'payment') {
-        // Credit pack — add 10 credits
-        const { data: profile, error: fetchErr } = await supabase
-          .from('profiles')
-          .select('credits')
-          .eq('id', userId)
-          .single();
-        if (fetchErr) { console.error('[webhook] fetch credits error:', fetchErr.message); break; }
 
-        const newCredits = (profile?.credits ?? 0) + 10;
-        const { error } = await supabase
-          .from('profiles')
-          .update({
-            credits: newCredits,
-            stripe_customer_id: session.customer,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', userId);
-        if (error) console.error('[webhook] credits update error:', error.message);
-        else console.log(`[webhook] Added 10 credits to user ${userId} (total: ${newCredits})`);
+        if (error) throw new Error(`Profile update failed: ${error.message}`);
+        console.log(`[webhook] Upgraded user ${userId} → Pro`);
+
+      } else if (session.mode === 'payment') {
+        // Credit pack — atomically claim the event AND increment credits in one
+        // DB transaction via process_credit_event(). If the increment fails, the
+        // claim is also rolled back so Stripe can retry cleanly.
+        const result = await processCreditEvent(supabase, {
+          eventId:          event.id,
+          userId,
+          amount:           10,
+          stripeCustomerId: session.customer,
+        });
+
+        if (result === 'duplicate') {
+          console.log(`[webhook] Duplicate payment event ${event.id} — skipping`);
+          break;
+        }
+        console.log(`[webhook] Added 10 credits to user ${userId}`);
       }
       break;
     }
@@ -111,10 +184,14 @@ async function handleStripeEvent(event) {
         .select('id')
         .eq('stripe_customer_id', subscription.customer)
         .maybeSingle();
-      if (error) { console.error('[webhook] lookup error:', error.message); break; }
-      if (!profile) { console.warn('[webhook] subscription.deleted: customer not found'); break; }
 
-      await supabase
+      if (error) throw new Error(`Profile lookup failed: ${error.message}`);
+      if (!profile) {
+        console.warn('[webhook] subscription.deleted: customer not found — skipping');
+        break;
+      }
+
+      const { error: updateErr } = await supabase
         .from('profiles')
         .update({
           subscription_tier: 'free',
@@ -122,6 +199,8 @@ async function handleStripeEvent(event) {
           updated_at: new Date().toISOString(),
         })
         .eq('id', profile.id);
+
+      if (updateErr) throw new Error(`Downgrade failed: ${updateErr.message}`);
       console.log(`[webhook] Downgraded user ${profile.id} → Free (subscription deleted)`);
       break;
     }
@@ -135,10 +214,11 @@ async function handleStripeEvent(event) {
         .select('id')
         .eq('stripe_customer_id', subscription.customer)
         .maybeSingle();
-      if (error) { console.error('[webhook] lookup error:', error.message); break; }
+
+      if (error) throw new Error(`Profile lookup failed: ${error.message}`);
       if (!profile) break;
 
-      await supabase
+      const { error: updateErr } = await supabase
         .from('profiles')
         .update({
           subscription_tier: 'free',
@@ -146,12 +226,13 @@ async function handleStripeEvent(event) {
           updated_at: new Date().toISOString(),
         })
         .eq('id', profile.id);
+
+      if (updateErr) throw new Error(`Downgrade failed: ${updateErr.message}`);
       console.log(`[webhook] Downgraded user ${profile.id} → Free (status: ${subscription.status})`);
       break;
     }
 
     default:
-      // Ignore unhandled events
       break;
   }
 }
@@ -280,12 +361,19 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. Stripe Checkout — create a Checkout Session and return the redirect URL
+// 5. Stripe Checkout — identity verified server-side via JWT
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/checkout', async (req, res) => {
-  const { planId, userId, userEmail } = req.body;
-  if (!planId || !userId)
-    return res.status(400).json({ error: 'planId and userId are required' });
+  let authUser;
+  try {
+    authUser = await verifyAuth(req);
+  } catch (err) {
+    return res.status(err.status ?? 401).json({ error: err.message });
+  }
+
+  const { planId } = req.body;
+  if (!planId)
+    return res.status(400).json({ error: 'planId is required' });
   if (!['pro', 'credits'].includes(planId))
     return res.status(400).json({ error: 'planId must be "pro" or "credits"' });
 
@@ -317,11 +405,12 @@ app.post('/api/checkout', async (req, res) => {
       payment_method_types: ['card'],
       line_items: [{ price: price.id, quantity: 1 }],
       mode,
-      client_reference_id: userId,
-      ...(userEmail ? { customer_email: userEmail } : {}),
+      // Identity comes from the verified JWT, not the request body
+      client_reference_id: authUser.id,
+      customer_email: authUser.email ?? undefined,
       success_url: `${baseUrl}/checkout/success?session_id={CHECKOUT_SESSION_ID}&plan=${planId}`,
       cancel_url: `${baseUrl}/pricing`,
-      metadata: { userId, planId },
+      metadata: { userId: authUser.id, planId },
     });
 
     res.json({ url: session.url });
@@ -332,22 +421,26 @@ app.post('/api/checkout', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. Stripe Customer Portal — manage subscription / cancel
+// 6. Stripe Customer Portal — identity verified server-side via JWT
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/portal', async (req, res) => {
-  const { userId } = req.body;
-  if (!userId) return res.status(400).json({ error: 'userId is required' });
+  let authUser;
+  try {
+    authUser = await verifyAuth(req);
+  } catch (err) {
+    return res.status(err.status ?? 401).json({ error: err.message });
+  }
 
   try {
     const supabase = getSupabaseAdmin();
     const { data: profile, error } = await supabase
       .from('profiles')
       .select('stripe_customer_id')
-      .eq('id', userId)
+      .eq('id', authUser.id)
       .single();
 
     if (error || !profile?.stripe_customer_id)
-      return res.status(404).json({ error: 'No Stripe customer found for this user' });
+      return res.status(404).json({ error: 'No Stripe customer found for this account' });
 
     const stripe = await getUncachableStripeClient();
     const baseUrl = process.env.REPLIT_DOMAINS
