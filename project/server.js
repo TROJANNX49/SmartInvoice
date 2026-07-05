@@ -4,6 +4,9 @@ import rateLimit from 'express-rate-limit';
 import OpenAI from 'openai';
 import { createClient } from '@supabase/supabase-js';
 import { getUncachableStripeClient } from './stripeClient.js';
+import { fileURLToPath } from 'url';
+import { dirname as pathDirname, join as pathJoin } from 'path';
+import fs from 'fs';
 
 const app = express();
 
@@ -465,25 +468,23 @@ app.post('/api/portal', async (req, res) => {
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. Static file serving (production only)
-//    In dev, Vite's dev server handles the frontend and proxies /api to here.
-//    In production, Express serves the built Vite app and handles /api itself.
+// 8. Static file serving
+//    Serve the Vite build from dist/ whenever it exists.
+//    In dev, requests arrive via the Vite proxy on port 5000 so the Express
+//    server on port 3001 is API-only — static serving here is harmless.
+//    In production, this is the only server so it must serve the frontend too.
 // ─────────────────────────────────────────────────────────────────────────────
-if (process.env.NODE_ENV === 'production') {
-  const { fileURLToPath } = await import('url');
-  const { dirname, join } = await import('path');
-  const { default: fs } = await import('fs');
-
-  const __dirname = dirname(fileURLToPath(import.meta.url));
-  const distPath = join(__dirname, 'dist');
+{
+  const __dirname = pathDirname(fileURLToPath(import.meta.url));
+  const distPath = pathJoin(__dirname, 'dist');
 
   if (fs.existsSync(distPath)) {
     app.use(express.static(distPath));
     // SPA fallback — let React Router handle client-side routes
-    app.get('*', (_req, res) => res.sendFile(join(distPath, 'index.html')));
+    app.get('/{*path}', (_req, res) => res.sendFile(pathJoin(distPath, 'index.html')));
     console.log(`Serving static build from ${distPath}`);
   } else {
-    console.error(`Build directory not found at ${distPath} — run "npm run build" first`);
+    console.log(`No dist/ build found — API-only mode (run "npm run build" to enable frontend)`);
   }
 }
 
