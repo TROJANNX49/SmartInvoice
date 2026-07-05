@@ -464,5 +464,30 @@ app.post('/api/portal', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-const PORT = process.env.API_PORT ?? 3001;
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Static file serving (production only)
+//    In dev, Vite's dev server handles the frontend and proxies /api to here.
+//    In production, Express serves the built Vite app and handles /api itself.
+// ─────────────────────────────────────────────────────────────────────────────
+if (process.env.NODE_ENV === 'production') {
+  const { fileURLToPath } = await import('url');
+  const { dirname, join } = await import('path');
+  const { default: fs } = await import('fs');
+
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const distPath = join(__dirname, 'dist');
+
+  if (fs.existsSync(distPath)) {
+    app.use(express.static(distPath));
+    // SPA fallback — let React Router handle client-side routes
+    app.get('*', (_req, res) => res.sendFile(join(distPath, 'index.html')));
+    console.log(`Serving static build from ${distPath}`);
+  } else {
+    console.error(`Build directory not found at ${distPath} — run "npm run build" first`);
+  }
+}
+
+// In dev the API runs on 3001 (Vite proxies /api → here).
+// In production Replit sets PORT for the autoscale runtime.
+const PORT = process.env.PORT ?? process.env.API_PORT ?? 3001;
 app.listen(PORT, () => console.log(`API server listening on port ${PORT}`));
