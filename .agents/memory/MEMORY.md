@@ -1,0 +1,1 @@
+- [SmartInvoice AI setup](smartinvoice-setup.md) — iCloud bookmark stubs replaced; Supabase env vars set; regex AI parser; port 5000 Vite.
