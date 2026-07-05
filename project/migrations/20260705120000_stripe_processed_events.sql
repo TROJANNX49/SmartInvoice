@@ -15,13 +15,12 @@ CREATE INDEX IF NOT EXISTS stripe_processed_events_created_at_idx
 -- 2. Atomic credit-event processing function.
 --
 --    Claim + increment happen inside ONE transaction:
---      • If another handler already claimed this event → unique_violation caught
+--      * If another handler already claimed this event → unique_violation caught
 --        inside the function → returns 'duplicate' with no side effects.
---      • If the UPDATE fails for any reason → the INSERT is also rolled back,
+--      * If the UPDATE fails for any reason → the INSERT is also rolled back,
 --        so Stripe can retry and the next attempt will claim the event fresh.
---
---    This eliminates the claim-before-increment race where a transient DB error
---    after INSERT would permanently block retries.
+--      * If the user row is not found → RAISE EXCEPTION rolls back the INSERT,
+--        so no orphaned claim is left and Stripe retries safely.
 --
 CREATE OR REPLACE FUNCTION process_credit_event(
   p_event_id           TEXT,
@@ -29,15 +28,15 @@ CREATE OR REPLACE FUNCTION process_credit_event(
   p_amount             INT,
   p_stripe_customer_id TEXT DEFAULT NULL
 )
-RETURNS TEXT            -- 'ok' | 'duplicate'
+RETURNS TEXT
 LANGUAGE plpgsql
-SECURITY DEFINER        -- runs as function owner, bypasses RLS on both tables
-AS $
+SECURITY DEFINER
+AS $func$
 DECLARE
   v_rowcount INT;
 BEGIN
-  -- Attempt to claim the event.  Raises unique_violation if already processed,
-  -- which is caught below and returned as 'duplicate' with no side effects.
+  -- Claim the event. Raises unique_violation if already processed,
+  -- caught below and returned as 'duplicate' with no side effects.
   INSERT INTO stripe_processed_events (id) VALUES (p_event_id);
 
   -- Atomic increment — no read-modify-write race possible.
@@ -48,9 +47,8 @@ BEGIN
     updated_at         = NOW()
   WHERE id = p_user_id;
 
-  -- Verify the UPDATE actually hit a row.  If the user doesn't exist the
-  -- INSERT above is rolled back automatically (we're in a transaction) and
-  -- Stripe can retry safely — no orphaned claim.
+  -- Verify the UPDATE hit a row. If the user doesn't exist, the INSERT
+  -- is rolled back automatically and Stripe can retry safely.
   GET DIAGNOSTICS v_rowcount = ROW_COUNT;
   IF v_rowcount <> 1 THEN
     RAISE EXCEPTION 'User % not found — credits not applied', p_user_id;
@@ -60,11 +58,11 @@ BEGIN
 
 EXCEPTION
   WHEN unique_violation THEN
-    -- Event already successfully processed; idempotent no-op.
+    -- Already processed — idempotent no-op.
     RETURN 'duplicate';
   -- All other exceptions propagate, rolling back the INSERT too.
 END;
-$;
+$func$;
 
 -- Restrict execute to service_role only (webhook server uses service-role key)
 REVOKE EXECUTE ON FUNCTION process_credit_event(TEXT, UUID, INT, TEXT) FROM PUBLIC;
