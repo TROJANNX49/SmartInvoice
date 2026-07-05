@@ -10,6 +10,7 @@ import { InvoiceDetailPage } from './pages/InvoiceDetailPage';
 import { TemplatesPage } from './pages/TemplatesPage';
 import { PricingPage } from './pages/PricingPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { CheckoutSuccessPage } from './pages/CheckoutSuccessPage';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -143,6 +144,7 @@ function AppRoutes() {
           </ProtectedRoute>
         }
       />
+      <Route path="/checkout/success" element={<CheckoutSuccessPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

@@ -9,6 +9,7 @@ import {
   CheckCircle,
   X,
   Loader2,
+  ExternalLink,
 } from 'lucide-react';
 
 const plans = [
@@ -48,7 +49,7 @@ const plans = [
     id: 'credits',
     name: 'Credit Pack',
     price: 5,
-    description: '10 invoice credits - no subscription',
+    description: '10 invoice credits — no subscription',
     features: [
       { text: '10 invoice credits', included: true },
       { text: 'No recurring payment', included: true },
@@ -66,16 +67,65 @@ const plans = [
 export function PricingPage() {
   const { user } = useAuth();
   const [loading, setLoading] = useState<string | null>(null);
-  const [showStripeNotice, setShowStripeNotice] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSubscribe = async (planId: string) => {
     if (!user) return;
-
     if (planId === 'free') return;
 
     setLoading(planId);
-    setShowStripeNotice(true);
-    setLoading(null);
+    setError(null);
+
+    try {
+      const res = await fetch('/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          planId,
+          userId: user.id,
+          userEmail: user.email,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error ?? `Checkout failed (${res.status})`);
+      }
+
+      // Redirect to Stripe Checkout
+      window.location.href = data.url;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Something went wrong. Please try again.';
+      setError(message);
+      setLoading(null);
+    }
+  };
+
+  const handleManageSubscription = async () => {
+    if (!user) return;
+    setLoading('portal');
+    setError(null);
+
+    try {
+      const res = await fetch('/api/portal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user.id }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error ?? 'Could not open billing portal');
+      }
+
+      window.location.href = data.url;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Something went wrong. Please try again.';
+      setError(message);
+      setLoading(null);
+    }
   };
 
   return (
@@ -89,9 +139,18 @@ export function PricingPage() {
         </p>
       </div>
 
+      {error && (
+        <div className="max-w-xl mx-auto bg-red-500/10 border border-red-500/30 rounded-xl p-4 flex items-start gap-3">
+          <X className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+          <p className="text-red-400 text-sm">{error}</p>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         {plans.map((plan) => {
-          const isCurrentPlan = user?.subscription_tier === plan.id || (plan.id === 'free' && !user?.subscription_tier);
+          const isCurrentPlan =
+            user?.subscription_tier === plan.id ||
+            (plan.id === 'free' && !user?.subscription_tier);
           const isLoading = loading === plan.id;
 
           return (
@@ -130,13 +189,13 @@ export function PricingPage() {
 
                 <button
                   onClick={() => handleSubscribe(plan.id)}
-                  disabled={isLoading || isCurrentPlan}
+                  disabled={isLoading || isCurrentPlan || loading !== null}
                   className={`w-full py-3 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 ${
                     isCurrentPlan
                       ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
                       : plan.popular
-                      ? 'bg-gradient-to-r from-emerald-500 to-cyan-500 text-white hover:from-emerald-600 hover:to-cyan-600 shadow-lg shadow-emerald-500/20'
-                      : 'bg-slate-700 text-white hover:bg-slate-600'
+                      ? 'bg-gradient-to-r from-emerald-500 to-cyan-500 text-white hover:from-emerald-600 hover:to-cyan-600 shadow-lg shadow-emerald-500/20 disabled:opacity-50'
+                      : 'bg-slate-700 text-white hover:bg-slate-600 disabled:opacity-50'
                   }`}
                 >
                   {isLoading ? (
@@ -177,7 +236,7 @@ export function PricingPage() {
       {user && (
         <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-slate-700/50 p-6">
           <h3 className="text-lg font-semibold text-white mb-4">Your Subscription</h3>
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between flex-wrap gap-4">
             <div className="flex items-center gap-4">
               <div className="p-3 rounded-xl bg-gradient-to-br from-emerald-500/20 to-cyan-500/20 border border-emerald-500/30">
                 <CreditCard className="w-6 h-6 text-emerald-400" />
@@ -187,72 +246,37 @@ export function PricingPage() {
                   {user.subscription_tier === 'pro' ? 'Pro Tier' : 'Free Plan'}
                 </p>
                 <p className="text-slate-400 text-sm">
-                  {user.credits} invoice credits available
+                  {user.subscription_tier === 'pro'
+                    ? 'Unlimited invoices'
+                    : `${user.credits} invoice credits available`}
                 </p>
               </div>
             </div>
-            {user.subscription_tier !== 'pro' && (
-              <button
-                onClick={() => handleSubscribe('pro')}
-                className="px-4 py-2 bg-emerald-500 text-white font-medium rounded-lg hover:bg-emerald-600 transition-colors"
-              >
-                Upgrade Now
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Stripe Setup Notice Modal */}
-      {showStripeNotice && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-slate-800 rounded-2xl border border-slate-700 max-w-md w-full p-6 relative">
-            <button
-              onClick={() => setShowStripeNotice(false)}
-              className="absolute top-4 right-4 p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-700 transition-colors"
-            >
-              <X className="w-5 h-5" />
-            </button>
-
-            <div className="flex items-center gap-3 mb-4">
-              <div className="p-3 rounded-xl bg-gradient-to-br from-emerald-500/20 to-cyan-500/20 border border-emerald-500/30">
-                <CreditCard className="w-6 h-6 text-emerald-400" />
-              </div>
-              <h3 className="text-xl font-semibold text-white">
-                Stripe Integration Required
-              </h3>
-            </div>
-
-            <p className="text-slate-400 mb-6">
-              To accept payments in your application, you'll need to set up Stripe integration. This requires a Stripe account and API keys.
-            </p>
-
-            <div className="bg-slate-900/50 rounded-xl p-4 mb-6">
-              <p className="text-sm text-slate-300 mb-2 font-medium">Required Environment Variables:</p>
-              <code className="text-xs text-emerald-400 block">
-                VITE_STRIPE_PUBLISHABLE_KEY=pk_test_...<br />
-                STRIPE_SECRET_KEY=sk_test_...<br />
-                STRIPE_WEBHOOK_SECRET=whsec_...
-              </code>
-            </div>
-
-            <div className="space-y-3">
-              <a
-                href="https://dashboard.stripe.com/register"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="block w-full py-3 bg-gradient-to-r from-emerald-500 to-cyan-500 text-white font-semibold rounded-xl text-center hover:from-emerald-600 hover:to-cyan-600 transition-all"
-              >
-                Create Stripe Account
-              </a>
-              <a
-                href="https://bolt.new/setup/stripe"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="block w-full py-3 bg-slate-700 text-white font-medium rounded-xl text-center hover:bg-slate-600 transition-all"
-              >
-                Setup Guide
-              </a>
+            <div className="flex items-center gap-3">
+              {user.subscription_tier !== 'pro' && (
+                <button
+                  onClick={() => handleSubscribe('pro')}
+                  disabled={loading !== null}
+                  className="px-4 py-2 bg-emerald-500 text-white font-medium rounded-lg hover:bg-emerald-600 transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {loading === 'pro' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                  Upgrade Now
+                </button>
+              )}
+              {user.stripe_customer_id && (
+                <button
+                  onClick={handleManageSubscription}
+                  disabled={loading !== null}
+                  className="px-4 py-2 bg-slate-700 text-white font-medium rounded-lg hover:bg-slate-600 transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {loading === 'portal' ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <ExternalLink className="w-4 h-4" />
+                  )}
+                  Manage Billing
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -260,7 +284,7 @@ export function PricingPage() {
 
       <div className="text-center">
         <p className="text-slate-500 text-sm">
-          All plans include 256-bit SSL encryption and secure payment processing.
+          All plans include 256-bit SSL encryption and secure payment processing via Stripe.
           <br />
           Questions? Contact support@smartinvoice.ai
         </p>
