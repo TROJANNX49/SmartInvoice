@@ -309,12 +309,13 @@ Return exactly this shape:
 Rules:
 - items[].total must equal quantity × unit_price
 - quantity must be a positive number; default to 1 if not specified
-- unit_price must be a non-negative number
+- unit_price must be a non-negative number; NEVER return 0 for unit_price if a monetary amount is mentioned
+- If only a grand total is mentioned (no per-item breakdown), create ONE item: description = best guess at the work done, quantity = 1, unit_price = that total amount, total = that total amount. Exclude tax from the unit_price if "including tax" is stated (back-calculate the pre-tax amount if a tax rate is inferable; otherwise use the total as-is).
 - payment_terms: use "Net 30" format when mentioned; otherwise ""
 - due_days: positive integer days until payment is due, or null
 - All monetary values must be numbers, not strings
 - client_email must be a valid email or ""
-- Never invent data — leave missing fields blank/null`;
+- Leave truly unknown fields as "" or null — do not fabricate names or emails`;
 
 function coerceItem(raw) {
   const qty = Math.max(0.001, Math.abs(Number(raw.quantity) || 1));

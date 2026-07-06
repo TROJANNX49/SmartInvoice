@@ -27,7 +27,7 @@ import {
 type Step = 'input' | 'review' | 'finalize';
 
 export function CreateInvoicePage() {
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const navigate = useNavigate();
 
   const [step, setStep] = useState<Step>('input');
@@ -120,7 +120,7 @@ export function CreateInvoicePage() {
       const parsed = await parseRawNotesWithAI(rawNotes, controller.signal);
       // Ignore result if this request was superseded
       if (controller.signal.aborted) return;
-      setClientName(parsed.client_name || 'Client');
+      setClientName(parsed.client_name || '');
       setClientEmail(parsed.client_email || '');
       setClientAddress(parsed.client_address || '');
       setItems(parsed.items.length > 0 ? parsed.items : [
@@ -201,6 +201,8 @@ export function CreateInvoicePage() {
       };
 
       const savedInvoice = await api.createInvoice(invoiceData);
+      // Refresh so the credit count in the header reflects the DB decrement
+      await refreshUser();
       navigate(`/invoices/${savedInvoice.id}`);
     } catch {
       setError('Failed to save invoice. Please try again.');
