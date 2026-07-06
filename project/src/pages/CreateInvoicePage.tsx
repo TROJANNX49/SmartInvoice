@@ -37,6 +37,7 @@ export function CreateInvoicePage() {
   const [saving, setSaving] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [parseSource, setParseSource] = useState<'ai' | 'fallback' | null>(null);
 
   const [clientName, setClientName] = useState('');
   const [clientEmail, setClientEmail] = useState('');
@@ -122,6 +123,7 @@ export function CreateInvoicePage() {
       const parsed = await parseRawNotesWithAI(rawNotes, controller.signal);
       // Ignore result if this request was superseded
       if (controller.signal.aborted) return;
+      setParseSource(parsed.source);
       setClientName(parsed.client_name || '');
       setClientEmail(parsed.client_email || '');
       setClientAddress(parsed.client_address || '');
@@ -379,6 +381,20 @@ Payment due in 30 days`}
       {/* Step 2: Review */}
       {step === 'review' && (
         <div className="space-y-6">
+          {parseSource === 'fallback' && (
+            <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="text-amber-300 font-medium">
+                  AI parsing was unavailable — we used the offline parser instead
+                </p>
+                <p className="text-amber-400/80 text-sm mt-1">
+                  The details below were extracted with our built-in pattern matcher, which
+                  is less accurate than AI. Please review every field carefully before saving.
+                </p>
+              </div>
+            </div>
+          )}
           <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-slate-700/50 overflow-hidden">
             <div className="p-6 border-b border-slate-700/50">
               <h2 className="text-xl font-semibold text-white">Client Information</h2>

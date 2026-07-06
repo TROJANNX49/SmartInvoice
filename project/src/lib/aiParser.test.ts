@@ -46,6 +46,29 @@ describe('parseRawNotesWithAI — regex fallback runs when the API call fails', 
   });
 });
 
+describe('source reporting — signals whether AI or the offline fallback ran', () => {
+  it("marks source as 'fallback' when the API call fails", async () => {
+    const result = await parseRawNotesWithAI('consulting $500');
+    expect(result.source).toBe('fallback');
+  });
+
+  it("marks source as 'ai' when the API responds successfully", async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          source: 'ai',
+          client_name: 'Acme',
+          items: [{ id: 'x', description: 'work', quantity: 1, unit_price: 100, total: 100 }],
+        }),
+      }),
+    );
+    const result = await parseRawNotesWithAI('some notes');
+    expect(result.source).toBe('ai');
+  });
+});
+
 describe('hourly rates', () => {
   it('parses "N hours of TASK at $RATE/hr"', async () => {
     const items = await parseItems('10 hours of design at $80/hr');

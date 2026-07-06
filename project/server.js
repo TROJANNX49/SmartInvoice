@@ -451,6 +451,7 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
         : [];
 
     res.json({
+      source: 'ai',
       client_name: String(parsed.client_name ?? '').trim(),
       client_email: String(parsed.client_email ?? '').trim(),
       client_address: String(parsed.client_address ?? '').trim(),

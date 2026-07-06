@@ -11,6 +11,13 @@ export interface ParsedInvoice {
   payment_terms: string;
   due_days: number | null;
   due_date?: string; // ISO YYYY-MM-DD, takes priority over due_days when set
+  /**
+   * Where the structured result came from:
+   * - 'ai'       → the server-side OpenAI parser succeeded
+   * - 'fallback' → the AI call failed (quota/network/etc.) and the local
+   *                regex heuristic parser produced the result instead
+   */
+  source: 'ai' | 'fallback';
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -95,6 +102,7 @@ export async function parseRawNotesWithAI(
       payment_terms: data.payment_terms ?? '',
       due_days: typeof data.due_days === 'number' ? data.due_days : null,
       due_date: typeof data.due_date === 'string' ? data.due_date : undefined,
+      source: data.source === 'ai' ? 'ai' : 'fallback',
     };
   } catch (err) {
     // Don't fall back on user-initiated cancellation
@@ -462,5 +470,5 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
     items.push({ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 });
   }
 
-  return { client_name, client_email, client_address, items, notes, payment_terms, due_days, due_date: due_date_override ?? undefined };
+  return { client_name, client_email, client_address, items, notes, payment_terms, due_days, due_date: due_date_override ?? undefined, source: 'fallback' };
 }
