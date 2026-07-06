@@ -74,118 +74,202 @@ export async function parseRawNotesWithAI(
 // ─── Regex Fallback Parser ────────────────────────────────────────────────────
 
 /**
- * Local regex heuristic parser used as a fallback when the API is unavailable.
+ * Local regex heuristic parser — fallback when the API is unavailable.
+ * Handles structured lists AND natural-language prose paragraphs.
  */
 function parseRawNotesRegex(rawText: string): ParsedInvoice {
-  const lines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
+  // Split into clauses: newlines + sentence boundaries + comma-separated phrases
+  const clauses = rawText
+    .split(/\n|(?<=[.!?])\s+|,\s+/)
+    .map((c) => c.trim())
+    .filter(Boolean);
+
+  // Work on the full text for broad pattern searches too
+  const full = rawText;
 
   // ── Client info ────────────────────────────────────────────────────────────
   let client_name = '';
   let client_email = '';
   let client_address = '';
 
-  for (const line of lines) {
-    if (!client_name && /^client\s*[:：]\s*/i.test(line)) {
-      client_name = line.replace(/^client\s*[:：]\s*/i, '').trim();
-      continue;
-    }
-    if (!client_email && /^(?:email|e-mail)\s*[:：]\s*/i.test(line)) {
-      client_email = line.replace(/^(?:email|e-mail)\s*[:：]\s*/i, '').trim();
-      continue;
-    }
-    if (!client_address && /^(?:address|addr|location)\s*[:：]\s*/i.test(line)) {
-      client_address = line.replace(/^(?:address|addr|location)\s*[:：]\s*/i, '').trim();
-      continue;
+  // Email anywhere in text
+  const emailMatch = full.match(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i);
+  if (emailMatch) client_email = emailMatch[0];
+
+  for (const clause of clauses) {
+    // Structured "Client: Name"
+    if (!client_name) {
+      const m = clause.match(/^client\s*[:：]\s*(.+)/i);
+      if (m) { client_name = m[1].trim(); continue; }
     }
     if (!client_email) {
-      const emailMatch = line.match(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i);
-      if (emailMatch) client_email = emailMatch[0];
+      const m = clause.match(/^(?:email|e-mail)\s*[:：]\s*(.+)/i);
+      if (m) { client_email = m[1].trim(); continue; }
+    }
+    if (!client_address) {
+      const m = clause.match(/^(?:address|addr|location)\s*[:：]\s*(.+)/i);
+      if (m) { client_address = m[1].trim(); continue; }
+    }
+
+    // Natural language: "for [Name]", "for the [Name] site/project/job"
+    if (!client_name) {
+      const m = clause.match(/\bfor\s+(?:the\s+)?([A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z.]*)*)\s*(?:site|project|job|account|client|company)?\b/);
+      if (m) {
+        const candidate = m[1].trim();
+        // Reject generic words that aren't names
+        if (!/^(this|the|a|an|our|your|their|that|which|my|his|her)$/i.test(candidate)) {
+          client_name = candidate;
+        }
+      }
     }
   }
 
   // ── Line items ─────────────────────────────────────────────────────────────
   const items: InvoiceItem[] = [];
 
-  const skipPrefixes = [
-    /^client\s*[:：]/i,
-    /^email\s*[:：]/i,
-    /^address\s*[:：]/i,
-    /^notes?\s*[:：]/i,
-    /^terms?\s*[:：]/i,
-    /^payment\s*(?:due|terms?)\s*[:：]/i,
-    /^(?:due\s*(?:date|in)|payment due)\s*/i,
-    /^work\s*done/i,
-    /^services?\s*(?:provided)?[:：]/i,
-  ];
+  const skipPattern = /^(?:client|email|e-mail|address|addr|location|notes?|terms?|payment\s+(?:due|terms?)|due\s+(?:date|in)|work\s+done|services?\s*(?:provided)?)\s*[:：]/i;
 
-  for (const line of lines) {
-    if (skipPrefixes.some((p) => p.test(line))) continue;
-    if (/^[A-Za-z\s]+:$/.test(line)) continue;
+  for (const clause of clauses) {
+    if (skipPattern.test(clause)) continue;
+    // Skip pure-heading lines like "Line Items:"
+    if (/^[A-Za-z\s]+:$/.test(clause)) continue;
 
-    // "Task (5 hours) at $100/hr: $500"
-    const hourMatch = line.match(
-      /^[-•*]?\s*(.+?)\s+\((\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\)\s+(?:at|@)\s+\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:\/hr)?\s*[:–-]?\s*\$\s*([\d,]+(?:\.\d{1,2})?)?/i
+    // ── Pattern 1: "N hours of TASK at $RATE/hr" (natural language)
+    // e.g. "4 hours of structural welding at $85/hr"
+    const nlHourMatch = clause.match(
+      /(\d+(?:\.\d+)?)\s+hours?\s+(?:of\s+)?(.+?)\s+at\s+\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:\/\s*hr)?/i
     );
-    if (hourMatch) {
-      const desc = hourMatch[1].trim();
-      const qty = parseFloat(hourMatch[2]);
-      const rate = parseFloat(hourMatch[3].replace(/,/g, ''));
-      const total = hourMatch[4] ? parseFloat(hourMatch[4].replace(/,/g, '')) : qty * rate;
+    if (nlHourMatch) {
+      const qty = parseFloat(nlHourMatch[1]);
+      const desc = nlHourMatch[2].trim();
+      const rate = parseFloat(nlHourMatch[3].replace(/,/g, ''));
+      if (qty > 0 && rate > 0) {
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
+        continue;
+      }
+    }
+
+    // ── Pattern 2: "TASK (N hours) at $RATE/hr" (structured)
+    const structHourMatch = clause.match(
+      /(.+?)\s+\((\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\)\s+(?:at|@)\s+\$\s*([\d,]+(?:\.\d{1,2})?)/i
+    );
+    if (structHourMatch) {
+      const desc = structHourMatch[1].trim();
+      const qty = parseFloat(structHourMatch[2]);
+      const rate = parseFloat(structHourMatch[3].replace(/,/g, ''));
       if (desc && qty > 0 && rate > 0) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total });
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
         continue;
       }
     }
 
-    // "Description: $amount"
-    const simpleMatch = line.match(/^[-•*]?\s*(.+?)[\s\-–:]+\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/);
-    if (simpleMatch) {
-      const desc = simpleMatch[1].trim();
-      const amount = parseFloat(simpleMatch[2].replace(/,/g, ''));
-      if (desc && amount > 0 && !skipPrefixes.some((p) => p.test(desc))) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
+    // ── Pattern 3: "N ITEM ($PRICE each)" or "N ITEM at $PRICE each"
+    // e.g. "2 heavy-duty steel beams ($400 each)"
+    const eachMatch = clause.match(
+      /(\d+(?:\.\d+)?)\s+(.+?)\s+(?:\(\s*)?\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:each|\s*\/\s*(?:unit|ea|pc))[\s)]/i
+    );
+    if (eachMatch) {
+      const qty = parseFloat(eachMatch[1]);
+      const desc = eachMatch[2].trim().replace(/[,.]$/, '');
+      const rate = parseFloat(eachMatch[3].replace(/,/g, ''));
+      if (qty > 0 && rate > 0) {
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
         continue;
       }
     }
 
-    // "N x $price" or "N @ $price"
-    const multiplyMatch = line.match(/^[-•*]?\s*(.+?)\s+(\d+(?:\.\d+)?)\s*[x×@]\s*\$\s*([\d,]+(?:\.\d{1,2})?)/i);
+    // ── Pattern 4: discount / credit (negative items)
+    // e.g. "giving a $100 discount", "crediting back $30", "$50 credit"
+    const discountMatch = clause.match(
+      /(?:giving?\s+(?:a\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)\s*discount|discount\s+(?:of\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)|deduct(?:ing)?\s+\$\s*([\d,]+(?:\.\d{1,2})?)|\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:off|discount))/i
+    );
+    if (discountMatch) {
+      const raw = discountMatch[1] || discountMatch[2] || discountMatch[3] || discountMatch[4];
+      const amount = parseFloat(raw.replace(/,/g, ''));
+      if (amount > 0) {
+        // Extract a label from the clause
+        const label = clause.replace(/\$[\d,.]+/g, '').replace(/\b(giving?|a|the|for|because|of|due\s+to)\b/gi, '').trim().replace(/[.,!?]+$/, '').trim() || 'Discount';
+        items.push({ id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
+        continue;
+      }
+    }
+
+    const creditMatch = clause.match(
+      /(?:credit(?:ing)?\s+(?:back\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)|refund(?:ing)?\s+\$\s*([\d,]+(?:\.\d{1,2})?)|\$\s*([\d,]+(?:\.\d{1,2})?)\s*credit)/i
+    );
+    if (creditMatch) {
+      const raw = creditMatch[1] || creditMatch[2] || creditMatch[3];
+      const amount = parseFloat(raw.replace(/,/g, ''));
+      if (amount > 0) {
+        const label = clause.replace(/\$[\d,.]+/g, '').replace(/\b(we|i|the|a|an|some|old|for|that|recovered|crediting|back)\b/gi, '').trim().replace(/[.,!?]+$/, '').trim() || 'Credit';
+        items.push({ id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
+        continue;
+      }
+    }
+
+    // ── Pattern 5: "N x $price" or "N @ $price"
+    const multiplyMatch = clause.match(
+      /^[-•*]?\s*(.+?)\s+(\d+(?:\.\d+)?)\s*[x×@]\s*\$\s*([\d,]+(?:\.\d{1,2})?)/i
+    );
     if (multiplyMatch) {
       const desc = multiplyMatch[1].trim();
       const qty = parseFloat(multiplyMatch[2]);
       const rate = parseFloat(multiplyMatch[3].replace(/,/g, ''));
       if (desc && qty > 0 && rate > 0) {
         items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
+        continue;
+      }
+    }
+
+    // ── Pattern 6: "ITEM which was/cost/priced at $AMOUNT" (prose amount)
+    // e.g. "a batch of MIG wire which was $50"
+    const proseAmountMatch = clause.match(
+      /(.+?)\s+(?:which\s+was|costs?\s*(?:us)?|priced?\s+at|worth|totaling?|came?\s+to)\s+\$\s*([\d,]+(?:\.\d{1,2})?)/i
+    );
+    if (proseAmountMatch) {
+      const desc = proseAmountMatch[1].replace(/^(?:a|an|the|some|that|this)\s+/i, '').trim();
+      const amount = parseFloat(proseAmountMatch[2].replace(/,/g, ''));
+      if (desc && amount > 0 && !skipPattern.test(desc)) {
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
+        continue;
+      }
+    }
+
+    // ── Pattern 7: simple "DESCRIPTION: $amount" or "DESCRIPTION — $amount"
+    const simpleMatch = clause.match(
+      /^[-•*]?\s*(.+?)[\s\-–:]+\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/
+    );
+    if (simpleMatch) {
+      const desc = simpleMatch[1].trim();
+      const amount = parseFloat(simpleMatch[2].replace(/,/g, ''));
+      if (desc && amount > 0 && !skipPattern.test(desc)) {
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
       }
     }
   }
 
   // ── Notes ──────────────────────────────────────────────────────────────────
   let notes = '';
-  for (const line of lines) {
-    if (/^notes?\s*[:：]/i.test(line)) {
-      notes = line.replace(/^notes?\s*[:：]\s*/i, '').trim();
-    }
+  for (const clause of clauses) {
+    const m = clause.match(/^notes?\s*[:：]\s*(.+)/i);
+    if (m) { notes = m[1].trim(); break; }
   }
 
   // ── Payment terms / due days ───────────────────────────────────────────────
   let payment_terms = '';
   let due_days: number | null = null;
 
-  for (const line of lines) {
-    const dueDaysMatch = line.match(/(?:payment\s+)?due\s+in\s+(\d+)\s+days?/i);
-    if (dueDaysMatch) due_days = parseInt(dueDaysMatch[1], 10);
+  const dueDaysMatch = full.match(/(?:payment\s+)?due\s+in\s+(\d+)\s+days?/i);
+  if (dueDaysMatch) due_days = parseInt(dueDaysMatch[1], 10);
 
-    const netMatch = line.match(/\bnet[-\s]?(\d+)\b/i);
-    if (netMatch) {
-      payment_terms = `Net ${netMatch[1]}`;
-      if (!due_days) due_days = parseInt(netMatch[1], 10);
-    }
-
-    if (/^(?:payment\s+)?terms?\s*[:：]/i.test(line)) {
-      payment_terms = line.replace(/^(?:payment\s+)?terms?\s*[:：]\s*/i, '').trim();
-    }
+  const netMatch = full.match(/\bnet[-\s]?(\d+)\b/i);
+  if (netMatch) {
+    payment_terms = `Net ${netMatch[1]}`;
+    if (!due_days) due_days = parseInt(netMatch[1], 10);
   }
+
+  const termsMatch = full.match(/^(?:payment\s+)?terms?\s*[:：]\s*(.+)/im);
+  if (termsMatch) payment_terms = termsMatch[1].trim();
 
   if (items.length === 0) {
     items.push({ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 });

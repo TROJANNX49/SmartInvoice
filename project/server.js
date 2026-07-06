@@ -307,26 +307,30 @@ Return exactly this shape:
 }
 
 Rules:
-- items[].total must equal quantity × unit_price
+- items[].total must equal quantity × unit_price (quantity × unit_price for negative items too)
 - quantity must be a positive number; default to 1 if not specified
-- unit_price must be a non-negative number; NEVER return 0 for unit_price if a monetary amount is mentioned
-- If only a grand total is mentioned (no per-item breakdown), create ONE item: description = best guess at the work done, quantity = 1, unit_price = that total amount, total = that total amount. Exclude tax from the unit_price if "including tax" is stated (back-calculate the pre-tax amount if a tax rate is inferable; otherwise use the total as-is).
+- unit_price CAN be negative for discounts, credits, or refunds — NEVER return 0 for a mentioned amount
+- For discounts/credits/deductions: use a negative unit_price (e.g. "discount" → unit_price: -100, total: -100)
+- If only a grand total is mentioned (no per-item breakdown), create ONE item: description = best guess at the work done, quantity = 1, unit_price = that total, total = that total
 - payment_terms: use "Net 30" format when mentioned; otherwise ""
 - due_days: positive integer days until payment is due, or null
 - All monetary values must be numbers, not strings
 - client_email must be a valid email or ""
-- Leave truly unknown fields as "" or null — do not fabricate names or emails`;
+- Extract client name from context (e.g. "for J. Smith", "the Acme project") — leave blank if truly unknown
+- Leave truly unknown fields as "" or null — do not fabricate emails or addresses`;
 
 function coerceItem(raw) {
   const qty = Math.max(0.001, Math.abs(Number(raw.quantity) || 1));
-  const price = Math.max(0, Number(raw.unit_price) || 0);
-  const total = Number(raw.total);
+  const price = Number(raw.unit_price) || 0; // allow negative for discounts/credits
+  const rawTotal = Number(raw.total);
+  // Prefer AI-supplied total; fall back to qty × price (preserves sign for discounts)
+  const total = Number.isFinite(rawTotal) ? rawTotal : qty * price;
   return {
     id: crypto.randomUUID(),
     description: String(raw.description ?? '').trim(),
     quantity: qty,
     unit_price: price,
-    total: Number.isFinite(total) && total >= 0 ? total : qty * price,
+    total,
   };
 }
 
