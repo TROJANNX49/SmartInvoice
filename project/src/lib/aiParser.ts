@@ -302,18 +302,27 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
     // Handles: "crediting back $30", "crediting them -$75", "-$75 for an overpayment",
     //          "credit of $X", "$X credit", "refunding $X"
     const creditMatch = seg.match(
-      /(?:credit(?:ing)?\s+(?:\w+\s+){0,3}(?:back\s+)?-?\$\s*([\d,]+(?:\.\d{1,2})?)|refund(?:ing)?\s+(?:\w+\s+){0,2}-?\$\s*([\d,]+(?:\.\d{1,2})?)|-\$\s*([\d,]+(?:\.\d{1,2})?)\s+for\s+(?:an?\s+)?(?:overpayment|credit|refund|adjustment)|\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:credit|overpayment\s+credit))/i
+      /(?:credit(?:ing)?\s+(?:\w+\s+){0,3}(?:back\s+)?-?\$\s*([\d,]+(?:\.\d{1,2})?)|refund(?:ing)?\s+(?:\w+\s+){0,2}-?\$\s*([\d,]+(?:\.\d{1,2})?)|-\$\s*([\d,]+(?:\.\d{1,2})?)\s+for\s+(?:an?\s+)?(?:overpayment|credit|refund|adjustment)|\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:credit|overpayment\s+credit)|-\$\s*([\d,]+(?:\.\d{1,2})?)\s+(?:\w+\s+){0,3}(?:overpayment|adjustment|credit|refund)\b)/i
     );
     if (creditMatch) {
-      const raw = creditMatch[1] || creditMatch[2] || creditMatch[3] || creditMatch[4];
+      const raw = creditMatch[1] || creditMatch[2] || creditMatch[3] || creditMatch[4] || creditMatch[5];
       const amount = parseAmt(raw);
       if (amount > 0) {
-        // Label: prefer the stated reason after "for a/an/the [reason]",
-        // e.g. "for a shipping error" -> "shipping error credit", "overpayment".
+        // Label: prefer the stated reason after "for a/an/the [reason]"
+        // ("for a shipping error" -> "shipping error credit"); otherwise fall back
+        // to the descriptor that follows the amount ("-$25 overpayment adjustment"
+        // -> "overpayment adjustment"). If the reason already ends in a credit-type
+        // noun, don't append a redundant "credit".
+        const CREDIT_NOUN = /(?:credit|refund|adjustment|overpayment)s?$/i;
         const reasonMatch =
           seg.match(/\bfor\s+(?:an?\s+|the\s+)?([a-z][a-z\s\-]+?)(?:\s+(?:that|which|on|from|of|last|this|happened|occurred)\b|[.,]|$)/i) ||
-          seg.match(/(?:recovered|sold|returned)\s+(?:some\s+)?(?:old\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:that|which|for)/i);
-        const label = reasonMatch ? `${reasonMatch[1].trim()} credit` : 'Credit';
+          seg.match(/(?:recovered|sold|returned)\s+(?:some\s+)?(?:old\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:that|which|for)/i) ||
+          seg.match(/-\$\s*[\d,]+(?:\.\d{1,2})?\s+([a-z][a-z\s\-]*?(?:overpayment|adjustment|credit|refund))\b/i);
+        let label = 'Credit';
+        if (reasonMatch) {
+          const reason = reasonMatch[1].trim();
+          label = CREDIT_NOUN.test(reason) ? reason : `${reason} credit`;
+        }
         consider(creditMatch, { id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
       }
     }

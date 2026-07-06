@@ -144,6 +144,13 @@ describe('credits / refunds (negative items with reason labels)', () => {
     expect(items[0].unit_price).toBe(-75);
     expect(items[0].total).toBe(-75);
   });
+
+  it('parses "-$X overpayment adjustment" (keyword after amount, no "for")', async () => {
+    const items = await parseItems('a final -$25 overpayment adjustment from the June statement');
+    expect(items).toHaveLength(1);
+    expect(items[0].unit_price).toBe(-25);
+    expect(items[0].total).toBe(-25);
+  });
 });
 
 describe('joiner separators split into multiple items', () => {
