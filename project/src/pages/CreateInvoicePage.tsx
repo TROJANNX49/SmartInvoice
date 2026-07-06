@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { api, InvoiceItem } from '../lib/api';
-import { parseRawNotesWithAI, generateInvoiceNumber } from '../lib/aiParser';
+import { parseRawNotesWithAI, generateInvoiceNumber, ParsedInvoice } from '../lib/aiParser';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 import {
@@ -38,6 +38,8 @@ export function CreateInvoicePage() {
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [parseSource, setParseSource] = useState<'ai' | 'fallback' | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
 
   const [clientName, setClientName] = useState('');
   const [clientEmail, setClientEmail] = useState('');
@@ -105,6 +107,38 @@ export function CreateInvoicePage() {
     }
   };
 
+  // Apply a parsed result to all invoice fields. Shared by the initial parse
+  // and the "Try AI parsing again" retry so both stay in sync.
+  const applyParsed = (parsed: ParsedInvoice) => {
+    setParseSource(parsed.source);
+    setClientName(parsed.client_name || '');
+    setClientEmail(parsed.client_email || '');
+    setClientAddress(parsed.client_address || '');
+    // Normalise every parsed item so total = abs(qty) × unit_price.
+    // This keeps item.total as the single source of truth and ensures
+    // any stale/mismatched total from the AI is immediately corrected.
+    const normalise = (raw: InvoiceItem): InvoiceItem => {
+      const qty = Math.abs(Number(raw.quantity)) || 1;
+      return { ...raw, quantity: qty, total: qty * Number(raw.unit_price) };
+    };
+    setItems(
+      parsed.items.length > 0
+        ? parsed.items.map(normalise)
+        : [{ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 }],
+    );
+    setNotes(parsed.notes);
+    if (parsed.payment_terms) setTerms(parsed.payment_terms);
+    if (parsed.due_date) {
+      // Specific calendar date returned (e.g. "30 july" → "2026-07-30")
+      setDueDate(parsed.due_date);
+    } else if (parsed.due_days) {
+      const d = new Date();
+      d.setDate(d.getDate() + parsed.due_days);
+      setDueDate(d.toISOString().split('T')[0]);
+    }
+    setTaxRate(0);
+  };
+
   const handleAIParse = async () => {
     if (!rawNotes.trim()) {
       setError('Please enter some notes to parse');
@@ -123,38 +157,40 @@ export function CreateInvoicePage() {
       const parsed = await parseRawNotesWithAI(rawNotes, controller.signal);
       // Ignore result if this request was superseded
       if (controller.signal.aborted) return;
-      setParseSource(parsed.source);
-      setClientName(parsed.client_name || '');
-      setClientEmail(parsed.client_email || '');
-      setClientAddress(parsed.client_address || '');
-      // Normalise every parsed item so total = abs(qty) × unit_price.
-      // This keeps item.total as the single source of truth and ensures
-      // any stale/mismatched total from the AI is immediately corrected.
-      const normalise = (raw: InvoiceItem): InvoiceItem => {
-        const qty = Math.abs(Number(raw.quantity)) || 1;
-        return { ...raw, quantity: qty, total: qty * Number(raw.unit_price) };
-      };
-      setItems(
-        parsed.items.length > 0
-          ? parsed.items.map(normalise)
-          : [{ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 }],
-      );
-      setNotes(parsed.notes);
-      if (parsed.payment_terms) setTerms(parsed.payment_terms);
-      if (parsed.due_date) {
-        // Specific calendar date returned (e.g. "30 july" → "2026-07-30")
-        setDueDate(parsed.due_date);
-      } else if (parsed.due_days) {
-        const d = new Date();
-        d.setDate(d.getDate() + parsed.due_days);
-        setDueDate(d.toISOString().split('T')[0]);
-      }
-      setTaxRate(0);
+      applyParsed(parsed);
       setStep('review');
     } catch {
       setError('Failed to parse notes. Please try again.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Re-run AI parsing from the Review step after an offline fallback. On a real
+  // AI success, replace the current fields and clear the fallback banner; if it
+  // falls back (or errors) again, keep the banner and show a brief message.
+  const handleRetryAIParse = async () => {
+    if (!rawNotes.trim()) return;
+
+    parseAbortRef.current?.abort();
+    const controller = new AbortController();
+    parseAbortRef.current = controller;
+
+    setRetrying(true);
+    setRetryError(null);
+
+    try {
+      const parsed = await parseRawNotesWithAI(rawNotes, controller.signal);
+      if (controller.signal.aborted) return;
+      if (parsed.source === 'ai') {
+        applyParsed(parsed);
+      } else {
+        setRetryError('AI parsing is still unavailable. Please try again in a moment.');
+      }
+    } catch {
+      setRetryError('AI parsing is still unavailable. Please try again in a moment.');
+    } finally {
+      setRetrying(false);
     }
   };
 
@@ -384,7 +420,7 @@ Payment due in 30 days`}
           {parseSource === 'fallback' && (
             <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 flex items-start gap-3">
               <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
-              <div>
+              <div className="flex-1">
                 <p className="text-amber-300 font-medium">
                   AI parsing was unavailable — we used the offline parser instead
                 </p>
@@ -392,6 +428,26 @@ Payment due in 30 days`}
                   The details below were extracted with our built-in pattern matcher, which
                   is less accurate than AI. Please review every field carefully before saving.
                 </p>
+                {retryError && (
+                  <p className="text-amber-300 text-sm mt-2">{retryError}</p>
+                )}
+                <button
+                  onClick={handleRetryAIParse}
+                  disabled={retrying}
+                  className="mt-3 inline-flex items-center gap-2 px-4 py-2 text-sm font-medium bg-amber-500/20 border border-amber-500/40 text-amber-200 rounded-lg hover:bg-amber-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                >
+                  {retrying ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Retrying...
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-4 h-4" />
+                      Try AI parsing again
+                    </>
+                  )}
+                </button>
               </div>
             </div>
           )}
