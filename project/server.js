@@ -349,16 +349,30 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
     return res.status(400).json({ error: `text must be ${MAX_INPUT_LENGTH} characters or fewer` });
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: text },
-      ],
-      temperature: 0.1,
-      max_tokens: 1000,
-      response_format: { type: 'json_object' },
-    });
+    // Retry once on 429 (rate-limit) with a short back-off
+    let completion;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: text },
+          ],
+          temperature: 0.1,
+          max_tokens: 1000,
+          response_format: { type: 'json_object' },
+        });
+        break; // success
+      } catch (apiErr) {
+        if (apiErr?.status === 429 && attempt < 2) {
+          console.warn('[parse-invoice] 429 rate-limit — retrying in 3s');
+          await new Promise((r) => setTimeout(r, 3000));
+        } else {
+          throw apiErr;
+        }
+      }
+    }
 
     const raw = completion.choices[0].message.content?.trim() ?? '{}';
     const parsed = JSON.parse(raw);

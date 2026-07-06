@@ -144,6 +144,10 @@ function AppRoutes() {
           </ProtectedRoute>
         }
       />
+      {/* Common aliases — redirect to the unified auth page */}
+      <Route path="/login" element={<Navigate to="/auth" replace />} />
+      <Route path="/signup" element={<Navigate to="/auth" replace />} />
+      <Route path="/register" element={<Navigate to="/auth" replace />} />
       <Route path="/checkout/success" element={<CheckoutSuccessPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
