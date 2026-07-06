@@ -27,6 +27,11 @@ async function parseItems(note: string): Promise<InvoiceItem[]> {
   return result.items;
 }
 
+/** Parse a note and return the full ParsedInvoice (fetch is already stubbed to fail). */
+async function parseFull(note: string) {
+  return parseRawNotesWithAI(note);
+}
+
 /** Assert a single item matches the given fields (ignoring the random id). */
 function expectItem(
   item: InvoiceItem,
@@ -214,5 +219,104 @@ describe('empty / non-item input', () => {
     const items = await parseItems('thanks for your business!');
     expect(items).toHaveLength(1);
     expectItem(items[0], { description: '', quantity: 1, unit_price: 0, total: 0 });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Client / date / payment-term extraction. These fields ride alongside the line
+// items on every parsed invoice; a regression here silently puts the wrong
+// client or due date on an invoice, so each case asserts the exact field value.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('client details — structured "Field: value" phrasing', () => {
+  it('extracts client_name, client_email, and client_address from labelled lines', async () => {
+    const r = await parseFull(
+      'Client: Acme Corp\nEmail: john@acme.com\nAddress: 123 Main Street, Springfield IL 62704',
+    );
+    expect(r.client_name).toBe('Acme Corp');
+    expect(r.client_email).toBe('john@acme.com');
+    // Address is captured up to the comma clause boundary.
+    expect(r.client_address).toBe('123 Main Street');
+  });
+
+  it('extracts a non-standard address via the "address:" label', async () => {
+    const r = await parseFull('address: 1213 ga3 jrad w9 phone 555');
+    // The whole single-clause line after the label is captured verbatim.
+    expect(r.client_address).toBe('1213 ga3 jrad w9 phone 555');
+  });
+});
+
+describe('client details — natural-language phrasing', () => {
+  it('extracts the name from "billing NAME"', async () => {
+    const r = await parseFull('billing Acme Corp for the new website');
+    expect(r.client_name).toBe('Acme Corp');
+  });
+
+  it('extracts a single-token name from "the NAME site"', async () => {
+    const r = await parseFull('the Globex site redesign');
+    expect(r.client_name).toBe('Globex');
+  });
+
+  it('extracts the name from "for the NAME site"', async () => {
+    const r = await parseFull('for the layzX site we did some work');
+    expect(r.client_name).toBe('layzX');
+  });
+
+  it('finds an email anywhere in the prose', async () => {
+    const r = await parseFull('work for Wayne Enterprises, email bruce@wayne.com');
+    expect(r.client_email).toBe('bruce@wayne.com');
+  });
+});
+
+describe('due dates — specific calendar dates', () => {
+  const thisYear = new Date().getFullYear();
+
+  it('parses day-month "30 july" to an ISO date in the current year', async () => {
+    const r = await parseFull('design work due 30 july');
+    expect(r.due_date).toBe(`${thisYear}-07-30`);
+    expect(r.due_days).toBeNull();
+  });
+
+  it('parses month-day "july 30" to an ISO date in the current year', async () => {
+    const r = await parseFull('july 30 payment expected');
+    expect(r.due_date).toBe(`${thisYear}-07-30`);
+  });
+
+  it('honours an explicit year "15 august 2027"', async () => {
+    const r = await parseFull('payment due 15 august 2027');
+    expect(r.due_date).toBe('2027-08-15');
+  });
+});
+
+describe('due dates — relative terms', () => {
+  it('parses "due in N days" into due_days', async () => {
+    const r = await parseFull('invoice due in 14 days');
+    expect(r.due_days).toBe(14);
+    expect(r.due_date).toBeUndefined();
+  });
+
+  it('parses "Net 30" into both payment_terms and due_days', async () => {
+    const r = await parseFull('Net 30');
+    expect(r.payment_terms).toBe('Net 30');
+    expect(r.due_days).toBe(30);
+  });
+
+  it('parses "net-45" (hyphenated) into "Net 45" and due_days 45', async () => {
+    const r = await parseFull('net-45 terms');
+    expect(r.payment_terms).toBe('Net 45');
+    expect(r.due_days).toBe(45);
+  });
+});
+
+describe('payment terms — explicit "Terms:" label', () => {
+  it('captures free-text terms after the label', async () => {
+    const r = await parseFull('Terms: 50% upfront, 50% on delivery');
+    expect(r.payment_terms).toBe('50% upfront, 50% on delivery');
+  });
+
+  it('extracts terms and due days together from a mixed note', async () => {
+    const r = await parseFull('consulting done, payment due in 30 days, net 30');
+    expect(r.due_days).toBe(30);
+    expect(r.payment_terms).toBe('Net 30');
   });
 });
