@@ -168,11 +168,16 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
         // "billing Acme Corp" / "invoicing layzX"
         new RegExp(`\\b(?:billing|invoicing)\\s+${nameCapture}\\b`, 'i'),
       ];
+      // Trailing filler words that get swept into a 2-token capture, e.g.
+      // "invoicing layzX for design work" → "layzX for". Strip them so only the
+      // real name remains.
+      const TRAILING_FILLER = /\s+(?:for|on|regarding|re|about|with|to|of)$/i;
       for (const pat of namePatterns) {
         const m = clause.match(pat);
         if (m) {
-          const candidate = m[1].trim();
-          if (!SKIP_NAMES.test(candidate)) {
+          let candidate = m[1].trim();
+          candidate = candidate.replace(TRAILING_FILLER, '').trim();
+          if (candidate && !SKIP_NAMES.test(candidate)) {
             client_name = candidate;
             break;
           }

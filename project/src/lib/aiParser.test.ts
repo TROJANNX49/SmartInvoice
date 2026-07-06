@@ -259,6 +259,26 @@ describe('client details — natural-language phrasing', () => {
     expect(r.client_name).toBe('Acme Corp');
   });
 
+  it('drops a trailing filler word from "invoicing NAME for ..."', async () => {
+    const r = await parseFull('invoicing layzX for design work');
+    expect(r.client_name).toBe('layzX');
+  });
+
+  it('drops a trailing filler word from "billing NAME on ..."', async () => {
+    const r = await parseFull('billing Globex on the retainer');
+    expect(r.client_name).toBe('Globex');
+  });
+
+  it('drops "regarding" after a name from "invoicing NAME regarding ..."', async () => {
+    const r = await parseFull('invoicing Initech regarding the audit');
+    expect(r.client_name).toBe('Initech');
+  });
+
+  it('keeps a real two-word name in "billing NAME NAME for ..."', async () => {
+    const r = await parseFull('billing Acme Corp for the new website');
+    expect(r.client_name).toBe('Acme Corp');
+  });
+
   it('extracts a single-token name from "the NAME site"', async () => {
     const r = await parseFull('the Globex site redesign');
     expect(r.client_name).toBe('Globex');
