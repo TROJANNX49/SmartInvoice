@@ -4,6 +4,7 @@ import rateLimit from 'express-rate-limit';
 import OpenAI from 'openai';
 import { createClient } from '@supabase/supabase-js';
 import { getUncachableStripeClient } from './stripeClient.js';
+import ws from 'ws';
 import { fileURLToPath } from 'url';
 import { dirname as pathDirname, join as pathJoin } from 'path';
 import fs from 'fs';
@@ -12,13 +13,21 @@ const app = express();
 
 // ── Supabase clients ──────────────────────────────────────────────────────────
 
+// Options shared by all server-side Supabase clients.
+// Node.js 20 has no native WebSocket — supply the 'ws' package so the
+// Supabase SDK doesn't throw when initialising the Realtime transport.
+const SUPABASE_SERVER_OPTS = {
+  auth: { persistSession: false },
+  realtime: { transport: ws },
+};
+
 /** Service-role client — bypasses RLS. Only used in webhook handler. */
 function getSupabaseAdmin() {
   const url = process.env.VITE_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key)
     throw new Error('VITE_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required');
-  return createClient(url, key, { auth: { persistSession: false } });
+  return createClient(url, key, SUPABASE_SERVER_OPTS);
 }
 
 /** Anon client — used only to verify user JWTs. */
@@ -27,7 +36,7 @@ function getSupabaseAnon() {
   const key = process.env.VITE_SUPABASE_ANON_KEY;
   if (!url || !key)
     throw new Error('VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY are required');
-  return createClient(url, key, { auth: { persistSession: false } });
+  return createClient(url, key, SUPABASE_SERVER_OPTS);
 }
 
 /**
