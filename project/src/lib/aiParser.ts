@@ -111,17 +111,38 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       if (m) { client_address = m[1].trim(); continue; }
     }
 
-    // Natural language: "for [Name]", "for the [Name] site/project/job"
+    // Natural language: "for [Name] site/project/job", "billing [Name]", "invoice for [Name]"
     if (!client_name) {
-      const m = clause.match(/\bfor\s+(?:the\s+)?([A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z.]*)*)\s*(?:site|project|job|account|client|company)?\b/);
-      if (m) {
-        const candidate = m[1].trim();
-        // Reject generic words that aren't names
-        if (!/^(this|the|a|an|our|your|their|that|which|my|his|her)$/i.test(candidate)) {
-          client_name = candidate;
+      // Allow initials with dots: J. Smith, A.B. Corp
+      const nameRe = /[A-Z][A-Za-z.]*(?:\s+[A-Z][A-Za-z.]*)*/;
+      const patterns = [
+        // "for the Henderson job" / "for J. Smith site"
+        new RegExp(`\\bfor\\s+(?:the\\s+)?(${nameRe.source})\\s*(?:site|project|job|account|client|company)?\\b`),
+        // "billing Acme Corp" / "invoice for Acme"
+        new RegExp(`\\b(?:billing|invoicing)\\s+(${nameRe.source})\\b`, 'i'),
+        // "the Acme project/job"
+        new RegExp(`\\bthe\\s+(${nameRe.source})\\s+(?:site|project|job|account)\\b`, 'i'),
+      ];
+      for (const pat of patterns) {
+        const m = clause.match(pat);
+        if (m) {
+          const candidate = m[1].trim();
+          if (!/^(this|the|a|an|our|your|their|that|which|my|his|her|work)$/i.test(candidate)) {
+            client_name = candidate;
+            break;
+          }
         }
       }
     }
+  }
+
+  // ── Address extraction ──────────────────────────────────────────────────────
+  // Look for street address patterns in the full text
+  if (!client_address) {
+    const addrMatch = full.match(
+      /\b(\d+\s+[A-Za-z0-9\s,.]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl)\b[A-Za-z0-9\s,.-]*(?:[A-Z]{2}\s+\d{5}(?:-\d{4})?)?)/i
+    );
+    if (addrMatch) client_address = addrMatch[1].trim();
   }
 
   // ── Line items ─────────────────────────────────────────────────────────────

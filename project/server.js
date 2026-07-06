@@ -316,7 +316,14 @@ Rules:
 - due_days: positive integer days until payment is due, or null
 - All monetary values must be numbers, not strings
 - client_email must be a valid email or ""
-- Extract client name from context (e.g. "for J. Smith", "the Acme project") — leave blank if truly unknown
+- client_name rules:
+    • Use the COMPANY or JOB CLIENT name, NOT the greeting/recipient name
+    • "Hi Sarah, invoice for the Henderson job" → client_name: "Henderson" (not "Sarah")
+    • "Hey Mike, billing Acme Corp for this work" → client_name: "Acme Corp" (not "Mike")
+    • If only a person's name appears as the client (no company), use that name
+    • Extract from phrases like "for [Name]", "the [Name] project/job/site", "billing [Name]"
+- client_address: extract any full or partial address (street, city, state, zip) mentioned anywhere in the text; combine into one string; leave "" if none
+- If a phone number is mentioned, include it in the notes field
 - Leave truly unknown fields as "" or null — do not fabricate emails or addresses`;
 
 function coerceItem(raw) {
