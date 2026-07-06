@@ -163,12 +163,15 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
 
   const skipPattern = /^(?:client|email|e-mail|address|addr|location|notes?|terms?|payment\s+(?:due|terms?)|due\s+(?:date|in)|work\s+done|services?\s*(?:provided)?)\s*[:：]/i;
 
-  // Pre-expand compound clauses: split on " and " only when BOTH sides contain a
-  // dollar amount — this catches "10 hrs of X at $Y and 4 Z at $W" without
-  // over-splitting natural phrases like "design and development".
+  // Pre-expand compound clauses: split on common item separators (" and ",
+  // " plus ", " as well as ", ";") only when EVERY resulting part contains a
+  // dollar amount — this catches "10 hrs of X at $Y and 4 Z at $W" or
+  // "$100 setup plus $50 delivery" without over-splitting natural phrases like
+  // "design and development".
+  const ITEM_SEPARATOR = /\s+and\s+|\s+plus\s+|\s+as\s+well\s+as\s+|\s+then\s+|\s*;\s*/i;
   const expandedClauses: string[] = [];
   for (const clause of clauses) {
-    const parts = clause.split(/\s+and\s+/i);
+    const parts = clause.split(ITEM_SEPARATOR);
     if (parts.length > 1 && parts.every((p) => /\$/.test(p))) {
       expandedClauses.push(...parts.map((p) => p.trim()).filter(Boolean));
     } else {
@@ -180,13 +183,25 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
   // e.g. "-$200" or "$200" both yield 200
   const parseAmt = (s: string) => Math.abs(parseFloat(s.replace(/,/g, '')));
 
-  for (const clause of expandedClauses) {
-    if (skipPattern.test(clause)) continue;
-    // Skip pure-heading lines like "Line Items:"
-    if (/^[A-Za-z\s]+:$/.test(clause)) continue;
+  // Extract ONE line item from `seg`, returning the item plus the index just past
+  // the matched text so the caller can keep scanning the remainder. Patterns are
+  // tried in priority order (same as before); returning `end` is what lets a single
+  // clause yield multiple items instead of stopping after the first match.
+  const endOf = (m: RegExpMatchArray) => (m.index ?? 0) + m[0].length;
+
+  const extractOneItem = (seg: string): { item: InvoiceItem; end: number } | null => {
+    // Collect every pattern's candidate item, then pick the one whose match begins
+    // EARLIEST in `seg`. Patterns are pushed in priority order, so on an equal start
+    // index the earlier (higher-priority) pattern wins the tie-break. This ensures an
+    // earlier-in-the-text item is never lost just because a later item happened to
+    // match a higher-priority pattern.
+    const candidates: { item: InvoiceItem; end: number; index: number }[] = [];
+    const consider = (m: RegExpMatchArray, item: InvoiceItem) => {
+      candidates.push({ item, end: endOf(m), index: m.index ?? 0 });
+    };
 
     // ── Pattern 1: "N hours of TASK at $RATE/hr"
-    const nlHourMatch = clause.match(
+    const nlHourMatch = seg.match(
       /(\d+(?:\.\d+)?)\s+hours?\s+(?:of\s+)?(.+?)\s+at\s+\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:\/\s*hr)?/i
     );
     if (nlHourMatch) {
@@ -194,13 +209,12 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       const desc = nlHourMatch[2].trim();
       const rate = parseFloat(nlHourMatch[3].replace(/,/g, ''));
       if (qty > 0 && rate > 0) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
-        continue;
+        consider(nlHourMatch, { id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
       }
     }
 
     // ── Pattern 2: "TASK (N hours) at $RATE/hr"
-    const structHourMatch = clause.match(
+    const structHourMatch = seg.match(
       /(.+?)\s+\((\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\)\s+(?:at|@)\s+\$\s*([\d,]+(?:\.\d{1,2})?)/i
     );
     if (structHourMatch) {
@@ -208,14 +222,13 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       const qty = parseFloat(structHourMatch[2]);
       const rate = parseFloat(structHourMatch[3].replace(/,/g, ''));
       if (desc && qty > 0 && rate > 0) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
-        continue;
+        consider(structHourMatch, { id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
       }
     }
 
     // ── Pattern 3: "N ITEM ($PRICE each)" or "N ITEM at $PRICE each"
     // Use \b instead of [\s)] so "each." (end of sentence) still matches.
-    const eachMatch = clause.match(
+    const eachMatch = seg.match(
       /(\d+(?:\.\d+)?)\s+(.+?)\s+(?:at\s+)?(?:\(\s*)?\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:each|\/\s*(?:unit|ea|pc))\b/i
     );
     if (eachMatch) {
@@ -223,15 +236,14 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       const desc = eachMatch[2].trim().replace(/[,.]$/, '');
       const rate = parseFloat(eachMatch[3].replace(/,/g, ''));
       if (qty > 0 && rate > 0) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
-        continue;
+        consider(eachMatch, { id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
       }
     }
 
     // ── Pattern 4a: discount
     // Handles: "giving a $100 discount", "$200 discount", "-$200 discount",
     //          "discount of $200", "deducting $X"
-    const discountMatch = clause.match(
+    const discountMatch = seg.match(
       /(?:giving?\s+(?:a\s+)?-?\$\s*([\d,]+(?:\.\d{1,2})?)\s*discount|discount\s+(?:of\s+)?-?\$\s*([\d,]+(?:\.\d{1,2})?)|deduct(?:ing)?\s+-?\$\s*([\d,]+(?:\.\d{1,2})?)|-?\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:off|discount))/i
     );
     if (discountMatch) {
@@ -239,37 +251,36 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       const amount = parseAmt(raw);
       if (amount > 0) {
         // Reason: "because of the delay", "due to X", or "for being a long-term partner"
-        const reasonMatch = clause.match(
-          /(?:because\s+of|due\s+to|for\s+(?:being\s+(?:a\s+)?)?)\s*(?:the\s+)?([a-z][a-z\s\-]+?)(?:\s+(?:and|on|in|of)\b|\.|,|$)/i
+        const reasonMatch = seg.match(
+          /(?:because\s+of|due\s+to|for\s+(?:being\s+(?:a\s+)?)?)\s*(?:the\s+)?([a-z][a-z\s\-]+?)(?:\s+(?:and|on|in|of|that|which)\b|\.|,|$)/i
         );
         const label = reasonMatch ? `Discount – ${reasonMatch[1].trim()}` : 'Discount';
-        items.push({ id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
-        continue;
+        consider(discountMatch, { id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
       }
     }
 
     // ── Pattern 4b: credit / overpayment / refund (negative items)
     // Handles: "crediting back $30", "crediting them -$75", "-$75 for an overpayment",
     //          "credit of $X", "$X credit", "refunding $X"
-    const creditMatch = clause.match(
+    const creditMatch = seg.match(
       /(?:credit(?:ing)?\s+(?:\w+\s+){0,3}(?:back\s+)?-?\$\s*([\d,]+(?:\.\d{1,2})?)|refund(?:ing)?\s+(?:\w+\s+){0,2}-?\$\s*([\d,]+(?:\.\d{1,2})?)|-\$\s*([\d,]+(?:\.\d{1,2})?)\s+for\s+(?:an?\s+)?(?:overpayment|credit|refund|adjustment)|\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:credit|overpayment\s+credit))/i
     );
     if (creditMatch) {
       const raw = creditMatch[1] || creditMatch[2] || creditMatch[3] || creditMatch[4];
       const amount = parseAmt(raw);
       if (amount > 0) {
-        // Label: prefer noun after "for a/an [reason]", e.g. "overpayment"
-        const nounMatch =
-          clause.match(/\bfor\s+(?:an?\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:on|from|of)/i) ||
-          clause.match(/(?:recovered|sold|returned)\s+(?:some\s+)?(?:old\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:that|which|for)/i);
-        const label = nounMatch ? `${nounMatch[1].trim()} credit` : 'Credit';
-        items.push({ id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
-        continue;
+        // Label: prefer the stated reason after "for a/an/the [reason]",
+        // e.g. "for a shipping error" -> "shipping error credit", "overpayment".
+        const reasonMatch =
+          seg.match(/\bfor\s+(?:an?\s+|the\s+)?([a-z][a-z\s\-]+?)(?:\s+(?:that|which|on|from|of|last|this|happened|occurred)\b|[.,]|$)/i) ||
+          seg.match(/(?:recovered|sold|returned)\s+(?:some\s+)?(?:old\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:that|which|for)/i);
+        const label = reasonMatch ? `${reasonMatch[1].trim()} credit` : 'Credit';
+        consider(creditMatch, { id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
       }
     }
 
     // ── Pattern 5: "N x $price" or "N @ $price"
-    const multiplyMatch = clause.match(
+    const multiplyMatch = seg.match(
       /^[-•*]?\s*(.+?)\s+(\d+(?:\.\d+)?)\s*[x×@]\s*\$\s*([\d,]+(?:\.\d{1,2})?)/i
     );
     if (multiplyMatch) {
@@ -277,13 +288,12 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       const qty = parseFloat(multiplyMatch[2]);
       const rate = parseFloat(multiplyMatch[3].replace(/,/g, ''));
       if (desc && qty > 0 && rate > 0) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
-        continue;
+        consider(multiplyMatch, { id: crypto.randomUUID(), description: desc, quantity: qty, unit_price: rate, total: qty * rate });
       }
     }
 
     // ── Pattern 6: "ITEM which was/cost/priced at $AMOUNT"
-    const proseAmountMatch = clause.match(
+    const proseAmountMatch = seg.match(
       /(.+?)\s+(?:which\s+was|costs?\s*(?:us)?|priced?\s+at|worth|totaling?|came?\s+to)\s+\$\s*([\d,]+(?:\.\d{1,2})?)/i
     );
     if (proseAmountMatch) {
@@ -295,35 +305,78 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
         .trim();
       const amount = parseFloat(proseAmountMatch[2].replace(/,/g, ''));
       if (desc && amount > 0 && !skipPattern.test(desc)) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
-        continue;
+        consider(proseAmountMatch, { id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
       }
     }
 
     // ── Pattern 7: "add/include/apply/charge $X [description]"  (amount-first)
     // e.g. "add a $100 rush fee", "include $50 delivery charge"
-    const addItemMatch = clause.match(
+    const addItemMatch = seg.match(
       /(?:add(?:ing)?|include|apply(?:ing)?|charge|please\s+add)\s+(?:a\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)\s+(.+)/i
     );
     if (addItemMatch) {
       const amount = parseFloat(addItemMatch[1].replace(/,/g, ''));
       const desc = addItemMatch[2].trim().replace(/[.,!?]+$/, '');
       if (amount > 0 && desc && !skipPattern.test(desc)) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
-        continue;
+        consider(addItemMatch, { id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
       }
     }
 
     // ── Pattern 8: simple "DESCRIPTION: $amount" or "DESCRIPTION — $amount"
-    const simpleMatch = clause.match(
+    const simpleMatch = seg.match(
       /^[-•*]?\s*(.+?)[\s\-–:]+\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/
     );
     if (simpleMatch) {
       const desc = simpleMatch[1].trim();
       const amount = parseFloat(simpleMatch[2].replace(/,/g, ''));
       if (desc && amount > 0 && !skipPattern.test(desc)) {
-        items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
+        consider(simpleMatch, { id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
       }
+    }
+
+    // ── Pattern 9: bare amount-first fragment "$X [for] DESCRIPTION"
+    // Anchored at the segment start (lowest priority) so it only fires on leftovers
+    // like "$50 for delivery" or "a $75 rush charge" produced by clause splitting —
+    // never mid-sentence prose (those begin with words, not the amount). The
+    // description stops before a following amount/separator so two run-together
+    // priced fragments aren't merged into one item.
+    const bareAmountMatch = seg.match(
+      /^(?:a\s+|an\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)\s+(?:for\s+)?(.+?)(?=\s+\$|\s*[;,]|$)/i
+    );
+    if (bareAmountMatch) {
+      const amount = parseFloat(bareAmountMatch[1].replace(/,/g, ''));
+      const desc = bareAmountMatch[2].trim().replace(/[.,!?]+$/, '');
+      if (amount > 0 && desc && !skipPattern.test(desc)) {
+        consider(bareAmountMatch, { id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
+      }
+    }
+
+    if (candidates.length === 0) return null;
+    const best = candidates.reduce((a, b) => (b.index < a.index ? b : a));
+    return { item: best.item, end: best.end };
+  };
+
+  for (const clause of expandedClauses) {
+    if (skipPattern.test(clause)) continue;
+    // Skip pure-heading lines like "Line Items:"
+    if (/^[A-Za-z\s]+:$/.test(clause)) continue;
+
+    // Scan the whole clause, consuming each matched entry and continuing on the
+    // remainder, so a single clause with several priced entries produces one line
+    // item per entry rather than stopping after the first match.
+    let seg = clause;
+    let guard = 0;
+    while (seg.trim().length > 0 && guard++ < 30) {
+      // Drop leading separators/punctuation left over from a previous match so the
+      // next fragment (e.g. "; $50 delivery") can be recognised.
+      seg = seg.replace(/^[\s;,]+/, '');
+      if (!seg) break;
+      const res = extractOneItem(seg);
+      if (!res) break;
+      items.push(res.item);
+      const next = seg.slice(res.end);
+      if (next.length >= seg.length) break; // safety: guarantee forward progress
+      seg = next;
     }
   }
 
