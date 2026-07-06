@@ -163,13 +163,29 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
 
   const skipPattern = /^(?:client|email|e-mail|address|addr|location|notes?|terms?|payment\s+(?:due|terms?)|due\s+(?:date|in)|work\s+done|services?\s*(?:provided)?)\s*[:：]/i;
 
+  // Pre-expand compound clauses: split on " and " only when BOTH sides contain a
+  // dollar amount — this catches "10 hrs of X at $Y and 4 Z at $W" without
+  // over-splitting natural phrases like "design and development".
+  const expandedClauses: string[] = [];
   for (const clause of clauses) {
+    const parts = clause.split(/\s+and\s+/i);
+    if (parts.length > 1 && parts.every((p) => /\$/.test(p))) {
+      expandedClauses.push(...parts.map((p) => p.trim()).filter(Boolean));
+    } else {
+      expandedClauses.push(clause);
+    }
+  }
+
+  // Helper: extract the amount from patterns that allow an explicit leading "-"
+  // e.g. "-$200" or "$200" both yield 200
+  const parseAmt = (s: string) => Math.abs(parseFloat(s.replace(/,/g, '')));
+
+  for (const clause of expandedClauses) {
     if (skipPattern.test(clause)) continue;
     // Skip pure-heading lines like "Line Items:"
     if (/^[A-Za-z\s]+:$/.test(clause)) continue;
 
-    // ── Pattern 1: "N hours of TASK at $RATE/hr" (natural language)
-    // e.g. "4 hours of structural welding at $85/hr"
+    // ── Pattern 1: "N hours of TASK at $RATE/hr"
     const nlHourMatch = clause.match(
       /(\d+(?:\.\d+)?)\s+hours?\s+(?:of\s+)?(.+?)\s+at\s+\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:\/\s*hr)?/i
     );
@@ -183,7 +199,7 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       }
     }
 
-    // ── Pattern 2: "TASK (N hours) at $RATE/hr" (structured)
+    // ── Pattern 2: "TASK (N hours) at $RATE/hr"
     const structHourMatch = clause.match(
       /(.+?)\s+\((\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\)\s+(?:at|@)\s+\$\s*([\d,]+(?:\.\d{1,2})?)/i
     );
@@ -198,9 +214,9 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
     }
 
     // ── Pattern 3: "N ITEM ($PRICE each)" or "N ITEM at $PRICE each"
-    // e.g. "2 heavy-duty steel beams ($400 each)"
+    // Use \b instead of [\s)] so "each." (end of sentence) still matches.
     const eachMatch = clause.match(
-      /(\d+(?:\.\d+)?)\s+(.+?)\s+(?:\(\s*)?\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:each|\s*\/\s*(?:unit|ea|pc))[\s)]/i
+      /(\d+(?:\.\d+)?)\s+(.+?)\s+(?:at\s+)?(?:\(\s*)?\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:each|\/\s*(?:unit|ea|pc))\b/i
     );
     if (eachMatch) {
       const qty = parseFloat(eachMatch[1]);
@@ -212,32 +228,40 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       }
     }
 
-    // ── Pattern 4: discount / credit (negative items)
-    // e.g. "giving a $100 discount", "crediting back $30", "$50 credit"
+    // ── Pattern 4a: discount
+    // Handles: "giving a $100 discount", "$200 discount", "-$200 discount",
+    //          "discount of $200", "deducting $X"
     const discountMatch = clause.match(
-      /(?:giving?\s+(?:a\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)\s*discount|discount\s+(?:of\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)|deduct(?:ing)?\s+\$\s*([\d,]+(?:\.\d{1,2})?)|\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:off|discount))/i
+      /(?:giving?\s+(?:a\s+)?-?\$\s*([\d,]+(?:\.\d{1,2})?)\s*discount|discount\s+(?:of\s+)?-?\$\s*([\d,]+(?:\.\d{1,2})?)|deduct(?:ing)?\s+-?\$\s*([\d,]+(?:\.\d{1,2})?)|-?\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:off|discount))/i
     );
     if (discountMatch) {
       const raw = discountMatch[1] || discountMatch[2] || discountMatch[3] || discountMatch[4];
-      const amount = parseFloat(raw.replace(/,/g, ''));
+      const amount = parseAmt(raw);
       if (amount > 0) {
-        // Try to pull out the reason: "because of the delay" → "delay"
-        const reasonMatch = clause.match(/(?:because\s+of|due\s+to)\s+(?:the\s+)?([a-z]+(?:\s+[a-z]+)?)/i);
-        const label = reasonMatch ? `Discount – ${reasonMatch[1]}` : 'Discount';
+        // Reason: "because of the delay", "due to X", or "for being a long-term partner"
+        const reasonMatch = clause.match(
+          /(?:because\s+of|due\s+to|for\s+(?:being\s+(?:a\s+)?)?)\s*(?:the\s+)?([a-z][a-z\s\-]+?)(?:\s+(?:and|on|in|of)\b|\.|,|$)/i
+        );
+        const label = reasonMatch ? `Discount – ${reasonMatch[1].trim()}` : 'Discount';
         items.push({ id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
         continue;
       }
     }
 
+    // ── Pattern 4b: credit / overpayment / refund (negative items)
+    // Handles: "crediting back $30", "crediting them -$75", "-$75 for an overpayment",
+    //          "credit of $X", "$X credit", "refunding $X"
     const creditMatch = clause.match(
-      /(?:credit(?:ing)?\s+(?:back\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)|refund(?:ing)?\s+\$\s*([\d,]+(?:\.\d{1,2})?)|\$\s*([\d,]+(?:\.\d{1,2})?)\s*credit)/i
+      /(?:credit(?:ing)?\s+(?:\w+\s+){0,3}(?:back\s+)?-?\$\s*([\d,]+(?:\.\d{1,2})?)|refund(?:ing)?\s+(?:\w+\s+){0,2}-?\$\s*([\d,]+(?:\.\d{1,2})?)|-\$\s*([\d,]+(?:\.\d{1,2})?)\s+for\s+(?:an?\s+)?(?:overpayment|credit|refund|adjustment)|\$\s*([\d,]+(?:\.\d{1,2})?)\s*(?:credit|overpayment\s+credit))/i
     );
     if (creditMatch) {
-      const raw = creditMatch[1] || creditMatch[2] || creditMatch[3];
-      const amount = parseFloat(raw.replace(/,/g, ''));
+      const raw = creditMatch[1] || creditMatch[2] || creditMatch[3] || creditMatch[4];
+      const amount = parseAmt(raw);
       if (amount > 0) {
-        // Try to grab the noun before "that I'm crediting" / "we recovered X"
-        const nounMatch = clause.match(/(?:recovered|sold|returned)\s+(?:some\s+)?(?:old\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:that|which|for)/i);
+        // Label: prefer noun after "for a/an [reason]", e.g. "overpayment"
+        const nounMatch =
+          clause.match(/\bfor\s+(?:an?\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:on|from|of)/i) ||
+          clause.match(/(?:recovered|sold|returned)\s+(?:some\s+)?(?:old\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:that|which|for)/i);
         const label = nounMatch ? `${nounMatch[1].trim()} credit` : 'Credit';
         items.push({ id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
         continue;
@@ -258,14 +282,12 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       }
     }
 
-    // ── Pattern 6: "ITEM which was/cost/priced at $AMOUNT" (prose amount)
-    // e.g. "a batch of MIG wire which was $50"
+    // ── Pattern 6: "ITEM which was/cost/priced at $AMOUNT"
     const proseAmountMatch = clause.match(
       /(.+?)\s+(?:which\s+was|costs?\s*(?:us)?|priced?\s+at|worth|totaling?|came?\s+to)\s+\$\s*([\d,]+(?:\.\d{1,2})?)/i
     );
     if (proseAmountMatch) {
       const raw = proseAmountMatch[1];
-      // Strip leading filler: "We used a batch of", "Also picked up some", etc.
       const desc = raw
         .replace(/^(?:we\s+)?(?:also\s+)?(?:used|picked\s+up|got|purchased|bought|need|needed|have|had|installed)\s+/i, '')
         .replace(/^(?:a\s+)?(?:batch\s+of\s+)?/i, '')
@@ -278,7 +300,21 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       }
     }
 
-    // ── Pattern 7: simple "DESCRIPTION: $amount" or "DESCRIPTION — $amount"
+    // ── Pattern 7: "add/include/apply/charge $X [description]"  (amount-first)
+    // e.g. "add a $100 rush fee", "include $50 delivery charge"
+    const addItemMatch = clause.match(
+      /(?:add(?:ing)?|include|apply(?:ing)?|charge|please\s+add)\s+(?:a\s+)?\$\s*([\d,]+(?:\.\d{1,2})?)\s+(.+)/i
+    );
+    if (addItemMatch) {
+      const amount = parseFloat(addItemMatch[1].replace(/,/g, ''));
+      const desc = addItemMatch[2].trim().replace(/[.,!?]+$/, '');
+      if (amount > 0 && desc && !skipPattern.test(desc)) {
+        items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
+        continue;
+      }
+    }
+
+    // ── Pattern 8: simple "DESCRIPTION: $amount" or "DESCRIPTION — $amount"
     const simpleMatch = clause.match(
       /^[-•*]?\s*(.+?)[\s\-–:]+\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/
     );
