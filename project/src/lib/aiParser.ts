@@ -23,12 +23,23 @@ export function generateInvoiceNumber(): string {
   return `${year}${month}-${random}`;
 }
 
-// ─── LLM Parser (calls server-side API) ──────────────────────────────────────
+// ─── Two-Pass Parser ─────────────────────────────────────────────────────────
 
 /**
- * Parses raw freeform notes into structured invoice data via the
- * server-side /api/parse-invoice endpoint (backed by OpenAI gpt-4o-mini).
- * Falls back to the regex heuristic parser if the API call fails.
+ * Parses raw freeform notes into structured invoice data using a two-pass
+ * strategy:
+ *
+ *   Pass 1 (AI extraction): POST the notes to /api/parse-invoice, which asks
+ *     OpenAI (gpt-4o-mini) to return line items conforming to a strict JSON
+ *     schema. This handles the vast majority of complex, natural-language
+ *     phrasing far more reliably than pattern matching.
+ *
+ *   Pass 2 (regex last resort): if the AI call errors OR comes back without any
+ *     usable line item, fall back to the local regex heuristic parser. Any
+ *     client / metadata fields the AI did manage to extract are preserved and
+ *     merged over the regex result so we keep the best of both.
+ *
+ * User-initiated cancellation (AbortError) is re-thrown and never falls back.
  */
 export async function parseRawNotesWithAI(
   rawText: string,
@@ -48,18 +59,38 @@ export async function parseRawNotesWithAI(
     }
 
     const data = await res.json();
+    const aiItems: InvoiceItem[] = Array.isArray(data.items) ? data.items : [];
 
-    // Ensure items array is populated even if LLM returned nothing
-    const items: InvoiceItem[] =
-      Array.isArray(data.items) && data.items.length > 0
-        ? data.items
-        : [{ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 }];
+    // A "usable" item has a real description or a non-zero amount. If Pass 1
+    // produced none, treat it as a miss and defer to the regex last resort.
+    const hasUsableItems = aiItems.some(
+      (i) =>
+        (typeof i.description === 'string' && i.description.trim().length > 0) ||
+        Number(i.unit_price) !== 0 ||
+        Number(i.total) !== 0,
+    );
+
+    if (!hasUsableItems) {
+      console.warn('[aiParser] AI returned no usable items — falling back to regex');
+      const regex = parseRawNotesRegex(rawText);
+      // Keep any client/metadata fields the AI extracted; take items from regex.
+      return {
+        ...regex,
+        client_name: data.client_name || regex.client_name,
+        client_email: data.client_email || regex.client_email,
+        client_address: data.client_address || regex.client_address,
+        notes: data.notes || regex.notes,
+        payment_terms: data.payment_terms || regex.payment_terms,
+        due_days: typeof data.due_days === 'number' ? data.due_days : regex.due_days,
+        due_date: typeof data.due_date === 'string' ? data.due_date : regex.due_date,
+      };
+    }
 
     return {
       client_name: data.client_name ?? '',
       client_email: data.client_email ?? '',
       client_address: data.client_address ?? '',
-      items,
+      items: aiItems,
       notes: data.notes ?? '',
       payment_terms: data.payment_terms ?? '',
       due_days: typeof data.due_days === 'number' ? data.due_days : null,
@@ -68,7 +99,7 @@ export async function parseRawNotesWithAI(
   } catch (err) {
     // Don't fall back on user-initiated cancellation
     if (err instanceof DOMException && err.name === 'AbortError') throw err;
-    console.warn('[aiParser] API call failed, falling back to regex:', err);
+    console.warn('[aiParser] AI call failed, falling back to regex:', err);
     return parseRawNotesRegex(rawText);
   }
 }

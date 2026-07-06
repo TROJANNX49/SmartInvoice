@@ -337,6 +337,53 @@ ITEM EXTRACTION — this is the most important rule. You MUST create a separate 
 - If a phone number is mentioned, include it in the notes field
 - Leave truly unknown fields as "" or null — do not fabricate emails or addresses`;
 
+// Structured Outputs schema — forces the model to return exactly this shape.
+// strict:true means every property is required and additionalProperties are
+// rejected, so Pass 1 either yields well-formed JSON or the request errors
+// (which makes the client fall back to the regex parser).
+const INVOICE_JSON_SCHEMA = {
+  name: 'invoice_extraction',
+  strict: true,
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      client_name: { type: 'string' },
+      client_email: { type: 'string' },
+      client_address: { type: 'string' },
+      items: {
+        type: 'array',
+        description: 'One entry per distinct billable item; discounts/credits use a negative unit_price.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            description: { type: 'string' },
+            quantity: { type: 'number' },
+            unit_price: { type: 'number' },
+            total: { type: 'number' },
+          },
+          required: ['description', 'quantity', 'unit_price', 'total'],
+        },
+      },
+      notes: { type: 'string' },
+      payment_terms: { type: 'string' },
+      due_days: { type: ['integer', 'null'] },
+      due_date: { type: ['string', 'null'] },
+    },
+    required: [
+      'client_name',
+      'client_email',
+      'client_address',
+      'items',
+      'notes',
+      'payment_terms',
+      'due_days',
+      'due_date',
+    ],
+  },
+};
+
 function coerceItem(raw) {
   const qty = Math.max(0.001, Math.abs(Number(raw.quantity) || 1));
   const price = Number(raw.unit_price) || 0; // allow negative for discounts/credits
@@ -372,7 +419,7 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
           ],
           temperature: 0.1,
           max_tokens: 1000,
-          response_format: { type: 'json_object' },
+          response_format: { type: 'json_schema', json_schema: INVOICE_JSON_SCHEMA },
         });
         break; // success
       } catch (apiErr) {
@@ -388,8 +435,8 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
     const rawContent = completion.choices[0].message.content?.trim() ?? '{}';
     console.log(`[parse-invoice] AI response received (${rawContent.length} chars)`);
 
-    // Try direct parse first (normal path with response_format: json_object).
-    // If the model wraps output in markdown fences, extract the first {...} block.
+    // Structured Outputs returns valid JSON directly. Keep a defensive markdown-
+    // fence fallback in case a future model/config wraps the output in ```.
     let parsed;
     try {
       parsed = JSON.parse(rawContent);
