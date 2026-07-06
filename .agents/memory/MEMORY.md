@@ -2,3 +2,4 @@
 - [AI parser architecture](ai-parser-arch.md) — Express server proxied via Vite; OpenAI gpt-4o-mini; regex fallback; security hardening done.
 - [Stripe integration](stripe-integration.md) — uses STRIPE_SECRET_KEY secret directly (no Replit connector); full security hardening applied.
 - [Parser multi-item extraction](parser-multi-item.md) — regex fallback: clause pre-expansion + earliest-match per-clause loop; keep amount-first pattern anchored & non-greedy.
+- [Parser regex-fallback testing](parser-testing.md) — vitest suite forces fallback by stubbing fetch to reject; `import type` on InvoiceItem is load-bearing.

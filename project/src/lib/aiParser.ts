@@ -1,4 +1,4 @@
-import { InvoiceItem } from './api';
+import type { InvoiceItem } from './api';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
