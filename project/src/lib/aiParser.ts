@@ -10,6 +10,7 @@ export interface ParsedInvoice {
   notes: string;
   payment_terms: string;
   due_days: number | null;
+  due_date?: string; // ISO YYYY-MM-DD, takes priority over due_days when set
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -62,6 +63,7 @@ export async function parseRawNotesWithAI(
       notes: data.notes ?? '',
       payment_terms: data.payment_terms ?? '',
       due_days: typeof data.due_days === 'number' ? data.due_days : null,
+      due_date: typeof data.due_date === 'string' ? data.due_date : undefined,
     };
   } catch (err) {
     // Don't fall back on user-initiated cancellation
@@ -111,23 +113,27 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       if (m) { client_address = m[1].trim(); continue; }
     }
 
-    // Natural language: "for [Name] site/project/job", "billing [Name]", "invoice for [Name]"
+    // Natural language name extraction — require the site/project/job keyword so we
+    // don't accidentally swallow surrounding words into the name.
     if (!client_name) {
-      // Allow initials with dots: J. Smith, A.B. Corp
-      const nameRe = /[A-Z][A-Za-z.]*(?:\s+[A-Z][A-Za-z.]*)*/;
-      const patterns = [
-        // "for the Henderson job" / "for J. Smith site"
-        new RegExp(`\\bfor\\s+(?:the\\s+)?(${nameRe.source})\\s*(?:site|project|job|account|client|company)?\\b`),
-        // "billing Acme Corp" / "invoice for Acme"
-        new RegExp(`\\b(?:billing|invoicing)\\s+(${nameRe.source})\\b`, 'i'),
-        // "the Acme project/job"
-        new RegExp(`\\bthe\\s+(${nameRe.source})\\s+(?:site|project|job|account)\\b`, 'i'),
+      const SKIP_NAMES = /^(this|the|a|an|our|your|their|that|which|my|his|her|work|project|invoice|estimate)$/i;
+      // Token: alphanumeric + underscores/dashes/dots (handles layzX, J., A.B.C)
+      const tok = '[A-Za-z0-9][A-Za-z0-9_.\\-]*';
+      const nameCapture = `(${tok}(?:\\s+${tok})?)`;  // 1–2 tokens only
+      const siteKw = '(?:site|project|job|account|client|company)';
+      const namePatterns = [
+        // "for the layzX site" / "for J. Smith project" (site keyword REQUIRED)
+        new RegExp(`\\bfor\\s+(?:the\\s+)?${nameCapture}\\s+${siteKw}\\b`, 'i'),
+        // "the layzX site" (1 token, site keyword REQUIRED)
+        new RegExp(`\\bthe\\s+(${tok})\\s+${siteKw}\\b`, 'i'),
+        // "billing Acme Corp" / "invoicing layzX"
+        new RegExp(`\\b(?:billing|invoicing)\\s+${nameCapture}\\b`, 'i'),
       ];
-      for (const pat of patterns) {
+      for (const pat of namePatterns) {
         const m = clause.match(pat);
         if (m) {
           const candidate = m[1].trim();
-          if (!/^(this|the|a|an|our|your|their|that|which|my|his|her|work)$/i.test(candidate)) {
+          if (!SKIP_NAMES.test(candidate)) {
             client_name = candidate;
             break;
           }
@@ -137,7 +143,14 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
   }
 
   // ── Address extraction ──────────────────────────────────────────────────────
-  // Look for street address patterns in the full text
+  // 1. Explicit "address" keyword — handles non-standard addresses like "1213 ga3 jrad w9"
+  if (!client_address) {
+    const kwAddr = full.match(
+      /\baddress[:\s]+(.+?)(?=\s*(?:\bphone\b|\bemail\b|\bdue\b|\blast\b|\bpayment\b|\bwe\b|\bI\b)|[.\n]|$)/i
+    );
+    if (kwAddr) client_address = kwAddr[1].trim();
+  }
+  // 2. Standard street address format as fallback
   if (!client_address) {
     const addrMatch = full.match(
       /\b(\d+\s+[A-Za-z0-9\s,.]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl)\b[A-Za-z0-9\s,.-]*(?:[A-Z]{2}\s+\d{5}(?:-\d{4})?)?)/i
@@ -208,8 +221,9 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       const raw = discountMatch[1] || discountMatch[2] || discountMatch[3] || discountMatch[4];
       const amount = parseFloat(raw.replace(/,/g, ''));
       if (amount > 0) {
-        // Extract a label from the clause
-        const label = clause.replace(/\$[\d,.]+/g, '').replace(/\b(giving?|a|the|for|because|of|due\s+to)\b/gi, '').trim().replace(/[.,!?]+$/, '').trim() || 'Discount';
+        // Try to pull out the reason: "because of the delay" → "delay"
+        const reasonMatch = clause.match(/(?:because\s+of|due\s+to)\s+(?:the\s+)?([a-z]+(?:\s+[a-z]+)?)/i);
+        const label = reasonMatch ? `Discount – ${reasonMatch[1]}` : 'Discount';
         items.push({ id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
         continue;
       }
@@ -222,7 +236,9 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       const raw = creditMatch[1] || creditMatch[2] || creditMatch[3];
       const amount = parseFloat(raw.replace(/,/g, ''));
       if (amount > 0) {
-        const label = clause.replace(/\$[\d,.]+/g, '').replace(/\b(we|i|the|a|an|some|old|for|that|recovered|crediting|back)\b/gi, '').trim().replace(/[.,!?]+$/, '').trim() || 'Credit';
+        // Try to grab the noun before "that I'm crediting" / "we recovered X"
+        const nounMatch = clause.match(/(?:recovered|sold|returned)\s+(?:some\s+)?(?:old\s+)?([a-z]+(?:\s+[a-z]+)?)\s+(?:that|which|for)/i);
+        const label = nounMatch ? `${nounMatch[1].trim()} credit` : 'Credit';
         items.push({ id: crypto.randomUUID(), description: label, quantity: 1, unit_price: -amount, total: -amount });
         continue;
       }
@@ -248,7 +264,13 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
       /(.+?)\s+(?:which\s+was|costs?\s*(?:us)?|priced?\s+at|worth|totaling?|came?\s+to)\s+\$\s*([\d,]+(?:\.\d{1,2})?)/i
     );
     if (proseAmountMatch) {
-      const desc = proseAmountMatch[1].replace(/^(?:a|an|the|some|that|this)\s+/i, '').trim();
+      const raw = proseAmountMatch[1];
+      // Strip leading filler: "We used a batch of", "Also picked up some", etc.
+      const desc = raw
+        .replace(/^(?:we\s+)?(?:also\s+)?(?:used|picked\s+up|got|purchased|bought|need|needed|have|had|installed)\s+/i, '')
+        .replace(/^(?:a\s+)?(?:batch\s+of\s+)?/i, '')
+        .replace(/^(?:a|an|the|some|that|this|also)\s+/i, '')
+        .trim();
       const amount = parseFloat(proseAmountMatch[2].replace(/,/g, ''));
       if (desc && amount > 0 && !skipPattern.test(desc)) {
         items.push({ id: crypto.randomUUID(), description: desc, quantity: 1, unit_price: amount, total: amount });
@@ -279,7 +301,31 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
   // ── Payment terms / due days ───────────────────────────────────────────────
   let payment_terms = '';
   let due_days: number | null = null;
+  let due_date_override: string | null = null; // ISO date string YYYY-MM-DD
 
+  // Specific calendar date: "30 july", "july 30", "30th july 2026", "july 30, 2026"
+  const MONTH_MAP: Record<string, number> = {
+    january:1, february:2, march:3, april:4, may:5, june:6,
+    july:7, august:8, september:9, october:10, november:11, december:12,
+  };
+  const dayMonthMatch = full.match(
+    /\b(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+(\d{4}))?\b/i
+  );
+  const monthDayMatch = full.match(
+    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?\b/i
+  );
+  const dateMatch = dayMonthMatch || monthDayMatch;
+  if (dateMatch) {
+    const isDayFirst = !!dayMonthMatch;
+    const day    = parseInt(isDayFirst ? dateMatch[1] : dateMatch[2], 10);
+    const month  = MONTH_MAP[(isDayFirst ? dateMatch[2] : dateMatch[1]).toLowerCase()];
+    const year   = dateMatch[3] ? parseInt(dateMatch[3], 10) : new Date().getFullYear();
+    if (day >= 1 && day <= 31 && month) {
+      due_date_override = `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+    }
+  }
+
+  // Relative "due in N days" / "Net 30"
   const dueDaysMatch = full.match(/(?:payment\s+)?due\s+in\s+(\d+)\s+days?/i);
   if (dueDaysMatch) due_days = parseInt(dueDaysMatch[1], 10);
 
@@ -296,5 +342,5 @@ function parseRawNotesRegex(rawText: string): ParsedInvoice {
     items.push({ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 });
   }
 
-  return { client_name, client_email, client_address, items, notes, payment_terms, due_days };
+  return { client_name, client_email, client_address, items, notes, payment_terms, due_days, due_date: due_date_override ?? undefined };
 }

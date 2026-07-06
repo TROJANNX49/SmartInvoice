@@ -128,7 +128,10 @@ export function CreateInvoicePage() {
       ]);
       setNotes(parsed.notes);
       if (parsed.payment_terms) setTerms(parsed.payment_terms);
-      if (parsed.due_days) {
+      if (parsed.due_date) {
+        // Specific calendar date returned (e.g. "30 july" → "2026-07-30")
+        setDueDate(parsed.due_date);
+      } else if (parsed.due_days) {
         const d = new Date();
         d.setDate(d.getDate() + parsed.due_days);
         setDueDate(d.toISOString().split('T')[0]);
