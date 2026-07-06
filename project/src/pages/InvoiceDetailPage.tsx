@@ -23,11 +23,17 @@ export function InvoiceDetailPage() {
   const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
+    // Guard: "create" is not a valid UUID — redirect to the create page
+    // instead of firing a pointless Supabase query with a bogus ID.
+    if (!id || id === 'create') {
+      navigate('/create', { replace: true });
+      return;
+    }
     fetchInvoice();
   }, [id]);
 
   const fetchInvoice = async () => {
-    if (!id) return;
+    if (!id || id === 'create') return;
 
     try {
       const data = await api.getInvoice(id);

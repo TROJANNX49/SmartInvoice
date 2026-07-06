@@ -112,6 +112,15 @@ function AppRoutes() {
           </ProtectedRoute>
         }
       />
+      {/* Explicit route so /invoices/create never hits the :id handler */}
+      <Route
+        path="/invoices/create"
+        element={
+          <ProtectedRoute>
+            <CreateInvoicePage />
+          </ProtectedRoute>
+        }
+      />
       <Route
         path="/invoices/:id"
         element={
