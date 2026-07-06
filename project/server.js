@@ -303,7 +303,8 @@ Return exactly this shape:
   ],
   "notes": "string",
   "payment_terms": "string",
-  "due_days": number | null
+  "due_days": number | null,
+  "due_date": "YYYY-MM-DD" | null
 }
 
 Rules:
@@ -313,7 +314,8 @@ Rules:
 - For discounts/credits/deductions: use a negative unit_price (e.g. "discount" → unit_price: -100, total: -100)
 - If only a grand total is mentioned (no per-item breakdown), create ONE item: description = best guess at the work done, quantity = 1, unit_price = that total, total = that total
 - payment_terms: use "Net 30" format when mentioned; otherwise ""
-- due_days: positive integer days until payment is due, or null
+- due_date: if a SPECIFIC calendar date is mentioned (e.g. "30 july", "July 30", "30/07/2026"), return it as "YYYY-MM-DD". Assume the current year if no year is stated. Set due_days to null when due_date is set.
+- due_days: use ONLY when no specific date is given — positive integer days until payment is due (e.g. "Net 30" → 30), or null
 - All monetary values must be numbers, not strings
 - client_email must be a valid email or ""
 - client_name rules:
@@ -322,7 +324,7 @@ Rules:
     • "Hey Mike, billing Acme Corp for this work" → client_name: "Acme Corp" (not "Mike")
     • If only a person's name appears as the client (no company), use that name
     • Extract from phrases like "for [Name]", "the [Name] project/job/site", "billing [Name]"
-- client_address: extract any full or partial address (street, city, state, zip) mentioned anywhere in the text; combine into one string; leave "" if none
+- client_address: extract any full or partial address (street, city, state, zip, or any location identifier) mentioned anywhere in the text; combine into one string; leave "" if none
 - If a phone number is mentioned, include it in the notes field
 - Leave truly unknown fields as "" or null — do not fabricate emails or addresses`;
 
@@ -374,8 +376,18 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
       }
     }
 
-    const raw = completion.choices[0].message.content?.trim() ?? '{}';
-    const parsed = JSON.parse(raw);
+    const rawContent = completion.choices[0].message.content?.trim() ?? '{}';
+    console.log(`[parse-invoice] AI response received (${rawContent.length} chars)`);
+
+    // Try direct parse first (normal path with response_format: json_object).
+    // If the model wraps output in markdown fences, extract the first {...} block.
+    let parsed;
+    try {
+      parsed = JSON.parse(rawContent);
+    } catch {
+      const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+      parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    }
 
     const items =
       Array.isArray(parsed.items) && parsed.items.length > 0
@@ -389,8 +401,13 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
       items,
       notes: String(parsed.notes ?? '').trim(),
       payment_terms: String(parsed.payment_terms ?? '').trim(),
-      due_days:
-        Number.isInteger(parsed.due_days) && parsed.due_days > 0 ? parsed.due_days : null,
+      // Prefer a specific calendar date; fall back to relative days; never both.
+      due_date: typeof parsed.due_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.due_date)
+        ? parsed.due_date
+        : null,
+      due_days: (typeof parsed.due_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.due_date))
+        ? null
+        : (Number.isInteger(parsed.due_days) && parsed.due_days > 0 ? parsed.due_days : null),
     });
   } catch (err) {
     console.error('[parse-invoice] error:', err?.message ?? err);

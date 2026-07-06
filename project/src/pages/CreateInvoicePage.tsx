@@ -57,6 +57,8 @@ export function CreateInvoicePage() {
   }, []);
 
   useEffect(() => {
+    // item.total is always normalised (abs(qty) × unit_price) when items are
+    // set — so summing it here is the single source of truth for all totals.
     const newSubtotal = items.reduce((sum, item) => sum + item.total, 0);
     const newTaxAmount = newSubtotal * (taxRate / 100);
     const newTotal = newSubtotal + newTaxAmount;
@@ -123,9 +125,18 @@ export function CreateInvoicePage() {
       setClientName(parsed.client_name || '');
       setClientEmail(parsed.client_email || '');
       setClientAddress(parsed.client_address || '');
-      setItems(parsed.items.length > 0 ? parsed.items : [
-        { id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 },
-      ]);
+      // Normalise every parsed item so total = abs(qty) × unit_price.
+      // This keeps item.total as the single source of truth and ensures
+      // any stale/mismatched total from the AI is immediately corrected.
+      const normalise = (raw: InvoiceItem): InvoiceItem => {
+        const qty = Math.abs(Number(raw.quantity)) || 1;
+        return { ...raw, quantity: qty, total: qty * Number(raw.unit_price) };
+      };
+      setItems(
+        parsed.items.length > 0
+          ? parsed.items.map(normalise)
+          : [{ id: crypto.randomUUID(), description: '', quantity: 1, unit_price: 0, total: 0 }],
+      );
       setNotes(parsed.notes);
       if (parsed.payment_terms) setTerms(parsed.payment_terms);
       if (parsed.due_date) {
@@ -167,7 +178,10 @@ export function CreateInvoicePage() {
         if (item.id !== id) return item;
         const updated = { ...item, [field]: value };
         if (field === 'quantity' || field === 'unit_price') {
-          updated.total = Number(updated.quantity) * Number(updated.unit_price);
+          // Quantity is always positive; sign lives on unit_price (negative = discount)
+          const qty = Math.abs(Number(updated.quantity)) || 1;
+          updated.quantity = qty;
+          updated.total = qty * Number(updated.unit_price);
         }
         return updated;
       })
@@ -476,7 +490,6 @@ Payment due in 30 days`}
                       onChange={(e) =>
                         handleItemChange(item.id, 'unit_price', parseFloat(e.target.value) || 0)
                       }
-                      min="0"
                       step="0.01"
                       className="w-full px-3 py-2 bg-slate-700/50 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
                     />
@@ -486,7 +499,9 @@ Payment due in 30 days`}
                       Total
                     </label>
                     <p className="px-3 py-2 text-white text-sm font-medium">
-                      ${item.total.toFixed(2)}
+                      {item.total < 0
+                        ? `-${Math.abs(item.total).toFixed(2)}`
+                        : `${item.total.toFixed(2)}`}
                     </p>
                   </div>
                   <div className="col-span-1 flex justify-end">
@@ -640,8 +655,12 @@ Payment due in 30 days`}
                       <tr key={item.id} className="border-b border-gray-100">
                         <td className="py-3 text-gray-900">{item.description}</td>
                         <td className="text-center py-3 text-gray-600">{item.quantity}</td>
-                        <td className="text-right py-3 text-gray-600">${item.unit_price.toFixed(2)}</td>
-                        <td className="text-right py-3 text-gray-900 font-medium">${item.total.toFixed(2)}</td>
+                        <td className="text-right py-3 text-gray-600">
+                          {item.unit_price < 0 ? `-${Math.abs(item.unit_price).toFixed(2)}` : `${item.unit_price.toFixed(2)}`}
+                        </td>
+                        <td className="text-right py-3 text-gray-900 font-medium">
+                          {item.total < 0 ? `-${Math.abs(item.total).toFixed(2)}` : `${item.total.toFixed(2)}`}
+                        </td>
                       </tr>
                     ))}
                 </tbody>
