@@ -308,11 +308,20 @@ Return exactly this shape:
 }
 
 Rules:
+
+ITEM EXTRACTION — this is the most important rule. You MUST create a separate line item for EVERY distinct billable entry mentioned in the notes. Never merge, skip, or omit any item. This includes:
+  • All services performed (e.g. "custom reports", "consulting", "installation")
+  • All physical goods or materials supplied
+  • All fees and surcharges (e.g. "rush fee", "call-out fee", "delivery charge")
+  • All discounts, credits, adjustments, and overpayments (as negative amounts)
+  • All retainers, deposits, or advance payments applied
+  Read the entire input carefully before writing the items array. If in doubt whether something is a line item, include it — do not leave it out.
+
 - items[].total must equal quantity × unit_price (quantity × unit_price for negative items too)
 - quantity must be a positive number; default to 1 if not specified
-- unit_price CAN be negative for discounts, credits, or refunds — NEVER return 0 for a mentioned amount
-- For discounts/credits/deductions: use a negative unit_price (e.g. "discount" → unit_price: -100, total: -100)
-- If only a grand total is mentioned (no per-item breakdown), create ONE item: description = best guess at the work done, quantity = 1, unit_price = that total, total = that total
+- unit_price CAN be negative for discounts, credits, overpayments, or refunds — NEVER return 0 for a mentioned amount
+- For discounts/credits/deductions/overpayments: use a negative unit_price (e.g. "overpayment credit" → unit_price: -50, total: -50)
+- If only a grand total is mentioned with no per-item breakdown, create ONE item: description = best guess at the work done, quantity = 1, unit_price = that total, total = that total
 - payment_terms: use "Net 30" format when mentioned; otherwise ""
 - due_date: if a SPECIFIC calendar date is mentioned (e.g. "30 july", "July 30", "30/07/2026"), return it as "YYYY-MM-DD". Assume the current year if no year is stated. Set due_days to null when due_date is set.
 - due_days: use ONLY when no specific date is given — positive integer days until payment is due (e.g. "Net 30" → 30), or null
