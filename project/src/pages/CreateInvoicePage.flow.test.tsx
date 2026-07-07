@@ -250,3 +250,89 @@ describe('Full invoice creation happy path', () => {
     expect(callArg.total).toBe(5400);
   });
 });
+
+// ── Edge-input guard tests ────────────────────────────────────────────────────
+//
+// These tests verify that handleItemChange prevents invalid quantity/unit_price
+// values from producing NaN or nonsensical totals on the Review step.
+//
+// Baseline (PARSED_AI_PAYLOAD):
+//   Website redesign: qty=2, unit_price=1000, total=2000
+//   Logo design:      qty=1, unit_price=400,  total=400
+//   Subtotal: $2400, Total: $2400 (tax=0)
+//
+// The qty input fires onChange with parseFloat(value)||0, then handleItemChange
+// clamps via Math.abs(qty)||1, so 0 and blank both fall back to qty=1.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Line-item edge-input guard', () => {
+  it('qty=0 clamps to 1 — item total and subtotal are not NaN and are ≥ 0', async () => {
+    await renderAtReviewStep();
+
+    // qty input for Website redesign currently shows '2'
+    const qtyInput = screen.getAllByDisplayValue('2')[0];
+    // onChange passes parseFloat('0')||0 = 0 to handleItemChange
+    fireEvent.change(qtyInput, { target: { value: '0' } });
+
+    await waitFor(() => {
+      // qty clamped to 1 → item total = 1 × 1000 = 1000.00
+      expect(screen.getByText('1000.00')).toBeInTheDocument();
+      // subtotal = 1000 + 400 = $1400.00; total same (tax=0)
+      expect(screen.getAllByText('$1400.00').length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Sanity: no NaN anywhere in the document
+    expect(screen.queryByText(/NaN/)).toBeNull();
+  });
+
+  it('qty=-5 is treated as abs(5) — item total and subtotal stay positive', async () => {
+    await renderAtReviewStep();
+
+    const qtyInput = screen.getAllByDisplayValue('2')[0];
+    // parseFloat('-5') = -5; -5||0 = -5 → handleItemChange receives -5
+    fireEvent.change(qtyInput, { target: { value: '-5' } });
+
+    await waitFor(() => {
+      // Math.abs(-5)=5 → item total = 5 × 1000 = 5000.00
+      expect(screen.getByText('5000.00')).toBeInTheDocument();
+      // subtotal = 5000 + 400 = $5400.00
+      expect(screen.getAllByText('$5400.00').length).toBeGreaterThanOrEqual(1);
+    });
+
+    expect(screen.queryByText(/NaN/)).toBeNull();
+  });
+
+  it('blank qty clamps to 1 — item total and subtotal are not NaN and are ≥ 0', async () => {
+    await renderAtReviewStep();
+
+    const qtyInput = screen.getAllByDisplayValue('2')[0];
+    // parseFloat('') = NaN; NaN||0 = 0 → handleItemChange receives 0
+    fireEvent.change(qtyInput, { target: { value: '' } });
+
+    await waitFor(() => {
+      // qty 0 → clamped to 1 → item total = 1 × 1000 = 1000.00
+      expect(screen.getByText('1000.00')).toBeInTheDocument();
+      // subtotal = 1000 + 400 = $1400.00
+      expect(screen.getAllByText('$1400.00').length).toBeGreaterThanOrEqual(1);
+    });
+
+    expect(screen.queryByText(/NaN/)).toBeNull();
+  });
+
+  it('negative unit_price (discount row) — item total is negative, subtotal is correct', async () => {
+    await renderAtReviewStep();
+
+    // Logo design has unit_price=400; change it to -200 to simulate a discount
+    const rateInput = screen.getAllByDisplayValue('400')[0];
+    fireEvent.change(rateInput, { target: { value: '-200' } });
+
+    await waitFor(() => {
+      // Logo total = 1 × -200 = -200, displayed as "-200.00"
+      expect(screen.getByText('-200.00')).toBeInTheDocument();
+      // subtotal = 2000 + (-200) = $1800.00; total same (tax=0)
+      expect(screen.getAllByText('$1800.00').length).toBeGreaterThanOrEqual(1);
+    });
+
+    expect(screen.queryByText(/NaN/)).toBeNull();
+  });
+});
