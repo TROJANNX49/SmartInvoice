@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
-import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
 import { getUncachableStripeClient } from './stripeClient.js';
 import ws from 'ws';
@@ -275,8 +275,27 @@ app.use(express.json({ limit: '64kb' }));
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. AI Parse endpoint
 // ─────────────────────────────────────────────────────────────────────────────
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MAX_INPUT_LENGTH = 4_000;
+
+// Returns a fresh Gemini model instance on every call (tokens/config don't cache).
+function getGeminiModel() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
+  const genAI = new GoogleGenerativeAI(apiKey);
+  return genAI.getGenerativeModel(
+    {
+      model: 'gemini-2.0-flash-lite',
+      systemInstruction: SYSTEM_PROMPT,
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: INVOICE_RESPONSE_SCHEMA,
+        temperature: 0.1,
+        maxOutputTokens: 1500,
+      },
+    },
+    { apiVersion: 'v1beta' },
+  );
+}
 
 const parseLimiter = rateLimit({
   windowMs: 60_000,
@@ -337,51 +356,38 @@ ITEM EXTRACTION — this is the most important rule. You MUST create a separate 
 - If a phone number is mentioned, include it in the notes field
 - Leave truly unknown fields as "" or null — do not fabricate emails or addresses`;
 
-// Structured Outputs schema — forces the model to return exactly this shape.
-// strict:true means every property is required and additionalProperties are
-// rejected, so Pass 1 either yields well-formed JSON or the request errors
-// (which makes the client fall back to the regex parser).
-const INVOICE_JSON_SCHEMA = {
-  name: 'invoice_extraction',
-  strict: true,
-  schema: {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      client_name: { type: 'string' },
-      client_email: { type: 'string' },
-      client_address: { type: 'string' },
+// Gemini responseSchema — enforces the invoice shape via JSON mode.
+// Uses OpenAPI-style types (uppercase strings). nullable:true is a separate
+// property (not a type union) in the Gemini schema spec.
+const INVOICE_RESPONSE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    client_name:    { type: 'STRING' },
+    client_email:   { type: 'STRING' },
+    client_address: { type: 'STRING' },
+    items: {
+      type: 'ARRAY',
+      description: 'One entry per distinct billable item; discounts/credits use a negative unit_price.',
       items: {
-        type: 'array',
-        description: 'One entry per distinct billable item; discounts/credits use a negative unit_price.',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            description: { type: 'string' },
-            quantity: { type: 'number' },
-            unit_price: { type: 'number' },
-            total: { type: 'number' },
-          },
-          required: ['description', 'quantity', 'unit_price', 'total'],
+        type: 'OBJECT',
+        properties: {
+          description: { type: 'STRING' },
+          quantity:    { type: 'NUMBER' },
+          unit_price:  { type: 'NUMBER' },
+          total:       { type: 'NUMBER' },
         },
+        required: ['description', 'quantity', 'unit_price', 'total'],
       },
-      notes: { type: 'string' },
-      payment_terms: { type: 'string' },
-      due_days: { type: ['integer', 'null'] },
-      due_date: { type: ['string', 'null'] },
     },
-    required: [
-      'client_name',
-      'client_email',
-      'client_address',
-      'items',
-      'notes',
-      'payment_terms',
-      'due_days',
-      'due_date',
-    ],
+    notes:         { type: 'STRING' },
+    payment_terms: { type: 'STRING' },
+    due_days:      { type: 'INTEGER', nullable: true },
+    due_date:      { type: 'STRING',  nullable: true },
   },
+  required: [
+    'client_name', 'client_email', 'client_address',
+    'items', 'notes', 'payment_terms', 'due_days', 'due_date',
+  ],
 };
 
 function coerceItem(raw) {
@@ -407,24 +413,19 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
     return res.status(400).json({ error: `text must be ${MAX_INPUT_LENGTH} characters or fewer` });
 
   try {
-    // Retry once on 429 (rate-limit) with a short back-off
-    let completion;
+    // Retry once on 429 / quota errors with a short back-off
+    let geminiResult;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        completion = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: text },
-          ],
-          temperature: 0.1,
-          max_tokens: 1000,
-          response_format: { type: 'json_schema', json_schema: INVOICE_JSON_SCHEMA },
-        });
+        const model = getGeminiModel();
+        geminiResult = await model.generateContent(text);
         break; // success
       } catch (apiErr) {
-        if (apiErr?.status === 429 && attempt < 2) {
-          console.warn('[parse-invoice] 429 rate-limit — retrying in 3s');
+        const isQuota = apiErr?.status === 429 ||
+          String(apiErr?.message).toLowerCase().includes('quota') ||
+          String(apiErr?.message).includes('429');
+        if (isQuota && attempt < 2) {
+          console.warn('[parse-invoice] quota/rate-limit — retrying in 3s');
           await new Promise((r) => setTimeout(r, 3000));
         } else {
           throw apiErr;
@@ -432,7 +433,7 @@ app.post('/api/parse-invoice', parseLimiter, async (req, res) => {
       }
     }
 
-    const rawContent = completion.choices[0].message.content?.trim() ?? '{}';
+    const rawContent = geminiResult.response.text().trim();
     console.log(`[parse-invoice] AI response received (${rawContent.length} chars)`);
 
     // Structured Outputs returns valid JSON directly. Keep a defensive markdown-
