@@ -52,7 +52,7 @@ vi.mock('../lib/api', () => ({
 }));
 
 // Import after mocks are registered
-import { api } from '../lib/api';
+import { api, type Invoice } from '../lib/api';
 import { CreateInvoicePage } from './CreateInvoicePage';
 
 // ── Fetch helpers ─────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ beforeEach(() => {
   mockNavigate.mockReset();
   mockRefreshUser.mockResolvedValue(undefined);
   vi.mocked(api.createInvoice).mockReset();
-  vi.mocked(api.createInvoice).mockResolvedValue({ id: 'inv-999' });
+  vi.mocked(api.createInvoice).mockResolvedValue({ id: 'inv-999' } as unknown as Invoice);
   vi.stubGlobal('fetch', vi.fn(makeAiFetch(PARSED_AI_PAYLOAD)));
 });
 
